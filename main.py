@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.1.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,18 +23,19 @@ app.add_middleware(
 )
 
 HEADERS = {"User-Agent": "Mozilla/5.0 personal stock study bot"}
+_CORP_CACHE = None
 
-# 1차 안정화용 고정 매핑. 필요한 종목은 여기에 계속 추가 가능.
-STOCKS = {
+# DART API 실패 시 최소 fallback
+FALLBACK_STOCKS = {
     "삼성전자": {"corp_code": "00126380", "stock_code": "005930"},
-    "삼천당제약": {"corp_code": "00130724", "stock_code": "000250"},
-    "동진쎄미켐": {"corp_code": "00132618", "stock_code": "005290"},
-    "한화비전": {"corp_code": "00159226", "stock_code": "489790"},
-    "파두": {"corp_code": "01598773", "stock_code": "440110"},
-    "롯데케미칼": {"corp_code": "00106106", "stock_code": "011170"},
+    "삼천당제약": {"corp_code": None, "stock_code": "000250"},
+    "동진쎄미켐": {"corp_code": None, "stock_code": "005290"},
+    "한화비전": {"corp_code": None, "stock_code": "489790"},
+    "파두": {"corp_code": None, "stock_code": "440110"},
+    "롯데케미칼": {"corp_code": None, "stock_code": "011170"},
     "SK하이닉스": {"corp_code": "00164779", "stock_code": "000660"},
     "현대차": {"corp_code": "00164742", "stock_code": "005380"},
-    "알테오젠": {"corp_code": "00631518", "stock_code": "196170"},
+    "알테오젠": {"corp_code": None, "stock_code": "196170"},
     "셀트리온": {"corp_code": "00413046", "stock_code": "068270"},
 }
 
@@ -45,11 +46,11 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "light-1.1"
+        "version": "v1.2"
     }
 
 
-def safe_int(text: str) -> Optional[int]:
+def safe_int(text: Any) -> Optional[int]:
     if text is None:
         return None
     cleaned = re.sub(r"[^0-9\-]", "", str(text))
@@ -61,59 +62,56 @@ def safe_int(text: str) -> Optional[int]:
         return None
 
 
+def load_dart_corp_list() -> List[Dict[str, str]]:
+    global _CORP_CACHE
+    if _CORP_CACHE is not None:
+        return _CORP_CACHE
+    if not DART_API_KEY:
+        _CORP_CACHE = []
+        return _CORP_CACHE
+    try:
+        url = "https://opendart.fss.or.kr/api/corpCode.xml"
+        r = requests.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
+        r.raise_for_status()
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_bytes = z.read("CORPCODE.xml")
+        root = ET.fromstring(xml_bytes)
+        rows = []
+        for item in root.findall("list"):
+            corp_name = item.findtext("corp_name")
+            corp_code = item.findtext("corp_code")
+            stock_code = item.findtext("stock_code")
+            if stock_code and stock_code.strip():
+                rows.append({
+                    "corp_name": corp_name.strip(),
+                    "corp_code": corp_code.strip().zfill(8),
+                    "stock_code": stock_code.strip().zfill(6),
+                })
+        _CORP_CACHE = rows
+        return rows
+    except Exception:
+        _CORP_CACHE = []
+        return _CORP_CACHE
+
+
 def resolve_stock(name: str) -> Dict[str, Any]:
     name = name.strip()
-    if name in STOCKS:
-        return {"name": name, **STOCKS[name], "matched_by": "fixed_map"}
-    # 부분 일치
-    for k, v in STOCKS.items():
+    rows = load_dart_corp_list()
+    for r in rows:
+        if r["corp_name"] == name:
+            return {"name": r["corp_name"], "corp_code": r["corp_code"], "stock_code": r["stock_code"], "matched_by": "dart_exact"}
+    for r in rows:
+        if name in r["corp_name"] or r["corp_name"] in name:
+            return {"name": r["corp_name"], "corp_code": r["corp_code"], "stock_code": r["stock_code"], "matched_by": "dart_partial"}
+    if name in FALLBACK_STOCKS:
+        return {"name": name, **FALLBACK_STOCKS[name], "matched_by": "fallback"}
+    for k, v in FALLBACK_STOCKS.items():
         if name in k or k in name:
-            return {"name": k, **v, "matched_by": "fixed_map_partial"}
-    return {
-        "name": name,
-        "corp_code": None,
-        "stock_code": None,
-        "error": "아직 고정 매핑에 없는 종목입니다. main.py의 STOCKS에 종목코드/corp_code를 추가해야 합니다."
-    }
+            return {"name": k, **v, "matched_by": "fallback_partial"}
+    return {"name": name, "corp_code": None, "stock_code": None, "error": "종목명 매칭 실패"}
 
 
-def fetch_naver_price(stock_code: str) -> Dict[str, Any]:
-    url = f"https://finance.naver.com/item/main.naver?code={stock_code}"
-    result = {
-        "source": url,
-        "previous_close": None,
-        "market_cap": None,
-        "shares_outstanding": None,
-        "note": "네이버증권 화면 기준 개인 스터디용 참고"
-    }
-    try:
-        html = requests.get(url, headers=HEADERS, timeout=10).text
-        soup = BeautifulSoup(html, "html.parser")
-
-        no_today = soup.select_one("p.no_today")
-        if no_today:
-            result["previous_close"] = safe_int(no_today.get_text("", strip=True))
-
-        text = soup.get_text(" ", strip=True)
-        # 상장주식수: 네이버 화면에서 '상장주식수 5,969,782,550' 형태 탐색
-        m = re.search(r"상장주식수\s*([0-9,]+)", text)
-        if m:
-            result["shares_outstanding"] = safe_int(m.group(1))
-
-        if result["previous_close"] and result["shares_outstanding"]:
-            result["market_cap"] = result["previous_close"] * result["shares_outstanding"]
-
-        # 시총 텍스트도 보조 저장
-        m2 = re.search(r"시가총액\s*([0-9,]+)\s*억원", text)
-        if m2:
-            result["market_cap_text"] = m2.group(1) + "억원"
-
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def fetch_naver_daily_prices(stock_code: str, pages: int = 15) -> List[Dict[str, Any]]:
+def fetch_naver_daily_prices(stock_code: str, pages: int = 25) -> List[Dict[str, Any]]:
     rows = []
     for page in range(1, pages + 1):
         url = f"https://finance.naver.com/item/sise_day.naver?code={stock_code}&page={page}"
@@ -130,7 +128,50 @@ def fetch_naver_daily_prices(stock_code: str, pages: int = 15) -> List[Dict[str,
                     })
         except Exception:
             continue
-    return [r for r in rows if r.get("date") and r.get("close")]
+    # 중복 제거
+    seen = set()
+    clean = []
+    for r in rows:
+        if r.get("date") and r.get("close") and r["date"] not in seen:
+            seen.add(r["date"])
+            clean.append(r)
+    return sorted(clean, key=lambda x: x["date"])
+
+
+def fetch_naver_price(stock_code: str) -> Dict[str, Any]:
+    url = f"https://finance.naver.com/item/main.naver?code={stock_code}"
+    result = {
+        "source": url,
+        "previous_close": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        "note": "네이버증권 화면 및 일별시세 기준 개인 스터디용 참고"
+    }
+    try:
+        # 현재가/전일 종가 역할은 네이버 일별시세의 최신 종가 사용
+        daily = fetch_naver_daily_prices(stock_code, pages=1)
+        if daily:
+            latest = daily[-1]
+            result["previous_close"] = latest["close"]
+            result["price_date"] = latest["date"]
+
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        m = re.search(r"상장주식수\s*([0-9,]+)", text)
+        if m:
+            result["shares_outstanding"] = safe_int(m.group(1))
+
+        m2 = re.search(r"시가총액\s*([0-9,]+)\s*억원", text)
+        if m2:
+            result["market_cap_text"] = m2.group(1) + "억원"
+
+        if result["previous_close"] and result["shares_outstanding"]:
+            result["market_cap"] = result["previous_close"] * result["shares_outstanding"]
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
 
 def weekly_summary(stock_code: str) -> Dict[str, Any]:
@@ -138,7 +179,6 @@ def weekly_summary(stock_code: str) -> Dict[str, Any]:
     if not daily:
         return {"note": "네이버 일별시세 확인 불가", "weekly": []}
 
-    # 주별 마지막 거래일 종가 추출
     parsed = []
     for r in daily:
         try:
@@ -146,12 +186,13 @@ def weekly_summary(stock_code: str) -> Dict[str, Any]:
             parsed.append((d, r["close"]))
         except Exception:
             pass
-    parsed = sorted(parsed)
+
     cutoff = dt.date.today() - dt.timedelta(days=370)
     parsed = [(d, c) for d, c in parsed if d >= cutoff]
     weeks = {}
     for d, c in parsed:
         year_week = d.isocalendar()[:2]
+        # 날짜순으로 돌기 때문에 같은 주 마지막 거래일이 남음
         weeks[year_week] = (d, c)
 
     weekly = [{"date": v[0].isoformat(), "close": v[1]} for _, v in sorted(weeks.items())][-52:]
@@ -166,24 +207,32 @@ def weekly_summary(stock_code: str) -> Dict[str, Any]:
 
 
 def dart_single_account_all(corp_code: str, year: int, report_code: str, fs_div: str = "CFS") -> List[Dict[str, Any]]:
-    if not DART_API_KEY:
+    if not DART_API_KEY or not corp_code:
         return []
-    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-    params = {
-        "crtfc_key": DART_API_KEY,
-        "corp_code": corp_code,
-        "bsns_year": str(year),
-        "reprt_code": report_code,
-        "fs_div": fs_div
-    }
-    js = requests.get(url, params=params, timeout=12).json()
-    if js.get("status") != "000":
+    try:
+        url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+        params = {
+            "crtfc_key": DART_API_KEY,
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": report_code,
+            "fs_div": fs_div
+        }
+        js = requests.get(url, params=params, timeout=12).json()
+        if js.get("status") != "000":
+            return []
+        return js.get("list", [])
+    except Exception:
         return []
-    return js.get("list", [])
 
 
 def amount_from_item(item: Dict[str, Any]) -> Optional[int]:
     return safe_int(item.get("thstrm_amount"))
+
+
+def pick_first(row: Dict[str, Any], key: str, amount: int):
+    if row.get(key) is None:
+        row[key] = amount
 
 
 def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
@@ -195,6 +244,7 @@ def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
         items = dart_single_account_all(corp_code, year, "11011", "CFS")
         if not items:
             items = dart_single_account_all(corp_code, year, "11011", "OFS")
+
         row = {
             "year": year,
             "revenue": None,
@@ -203,28 +253,29 @@ def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
             "assets": None,
             "liabilities": None,
             "equity": None,
-            "operating_margin": None
+            "operating_margin": None,
+            "dart_item_count": len(items)
         }
+
         for it in items:
-            acc = it.get("account_nm", "")
+            acc = it.get("account_nm", "").replace(" ", "")
             amt = amount_from_item(it)
             if amt is None:
                 continue
-            if acc in ["매출액", "수익(매출액)", "영업수익"]:
-                if row["revenue"] is None:
-                    row["revenue"] = amt
-            elif acc in ["영업이익", "영업이익(손실)"]:
-                if row["operating_income"] is None:
-                    row["operating_income"] = amt
-            elif acc in ["당기순이익", "당기순이익(손실)"]:
-                if row["net_income"] is None:
-                    row["net_income"] = amt
+
+            if acc in ["매출액", "수익(매출액)", "영업수익", "매출", "매출수익"]:
+                pick_first(row, "revenue", amt)
+            elif acc in ["영업이익", "영업이익(손실)", "영업손익"]:
+                pick_first(row, "operating_income", amt)
+            elif acc in ["당기순이익", "당기순이익(손실)", "연결당기순이익", "당기순손익"]:
+                pick_first(row, "net_income", amt)
             elif acc == "자산총계":
                 row["assets"] = amt
             elif acc == "부채총계":
                 row["liabilities"] = amt
             elif acc == "자본총계":
                 row["equity"] = amt
+
         if row["revenue"] and row["operating_income"] is not None:
             row["operating_margin"] = round(row["operating_income"] / row["revenue"] * 100, 1)
         out.append(row)
@@ -233,14 +284,16 @@ def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
 
 def latest_regular_report(corp_code: str) -> Dict[str, Any]:
     if not corp_code:
-        return {}
+        return {"note": "corp_code 없음"}
     y = dt.date.today().year
-    # 최신 정기보고서 우선순위: 올해 3Q/반기/1Q, 전년 사업보고서
     candidates = [
         (y, "11014", "3분기보고서"),
         (y, "11012", "반기보고서"),
         (y, "11013", "1분기보고서"),
         (y - 1, "11011", "사업보고서"),
+        (y - 1, "11014", "3분기보고서"),
+        (y - 1, "11012", "반기보고서"),
+        (y - 1, "11013", "1분기보고서"),
     ]
     for year, code, label in candidates:
         items = dart_single_account_all(corp_code, year, code, "CFS")
@@ -248,6 +301,7 @@ def latest_regular_report(corp_code: str) -> Dict[str, Any]:
             items = dart_single_account_all(corp_code, year, code, "OFS")
         if not items:
             continue
+
         row = {
             "year": year,
             "report_type": label,
@@ -255,23 +309,26 @@ def latest_regular_report(corp_code: str) -> Dict[str, Any]:
             "liabilities": None,
             "equity": None,
             "debt_ratio": None,
-            "order_backlog": "확인 불가 - 수주잔고는 보고서 본문 파싱 2차 개발 필요"
+            "order_backlog": "확인 불가 - 수주잔고는 보고서 본문 파싱 2차 개발 필요",
+            "dart_item_count": len(items)
         }
+
         for it in items:
-            acc = it.get("account_nm", "")
+            acc = it.get("account_nm", "").replace(" ", "")
             amt = amount_from_item(it)
             if amt is None:
                 continue
-            if acc in ["현금및현금성자산", "현금 및 현금성자산"]:
-                if row["cash_and_cash_equivalents"] is None:
-                    row["cash_and_cash_equivalents"] = amt
+            if acc in ["현금및현금성자산", "현금및현금성자산및단기금융상품", "현금"]:
+                pick_first(row, "cash_and_cash_equivalents", amt)
             elif acc == "부채총계":
                 row["liabilities"] = amt
             elif acc == "자본총계":
                 row["equity"] = amt
+
         if row["liabilities"] is not None and row["equity"]:
             row["debt_ratio"] = round(row["liabilities"] / row["equity"] * 100, 1)
         return row
+
     return {"note": "최신 정기보고서 재무 데이터 확인 불가"}
 
 
@@ -290,7 +347,6 @@ def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
 
 
 def dcinside_links(name: str) -> List[Dict[str, str]]:
-    # 1차 버전에서는 차단 가능성이 높아 링크만 제공
     q = requests.utils.quote(name)
     return [{
         "note": "디시인사이드 검색은 차단/구조변경 가능성이 있어 GPT가 참고 링크로 확인",
@@ -305,13 +361,13 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
         return {"input": name, "resolved": resolved, "error": resolved.get("error")}
 
     stock_code = resolved["stock_code"]
-    corp_code = resolved["corp_code"]
+    corp_code = resolved.get("corp_code")
 
     return {
         "input": name,
         "resolved": resolved,
         "data_basis": {
-            "price_market_cap": "네이버증권 전일 종가 기준",
+            "price_market_cap": "네이버증권 일별시세 최신 종가 기준",
             "historical_financials": "DART 사업보고서 기준",
             "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준",
             "consensus": "네이버증권 기준 - 2차 개발 필요",
