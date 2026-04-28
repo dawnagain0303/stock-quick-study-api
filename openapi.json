@@ -1,0 +1,55 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Korean Stock Quick Study API",
+    "description": "한국 주식 종목명을 받아 DART, 네이버증권, 뉴스/커뮤니티 기반 퀵 스터디 데이터를 반환합니다.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-RENDER-URL.onrender.com"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "서버 상태 확인",
+        "responses": {
+          "200": {
+            "description": "정상 응답"
+          }
+        }
+      }
+    },
+    "/stock-report": {
+      "get": {
+        "operationId": "getStockReport",
+        "summary": "종목 퀵 스터디 데이터 조회",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "description": "한국 주식 종목명. 예: 삼천당제약",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "종목 리포트 데이터",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
