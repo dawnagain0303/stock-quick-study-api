@@ -1,21 +1,18 @@
 # stock-quick-study-api
 
-개인 스터디용 한국 주식 퀵 리포트 API입니다.
+가벼운 2차 수정본입니다.
+
+## 바뀐 점
+- pandas 제거
+- lxml 제거
+- matplotlib 제거
+- DART 전체 기업코드 XML 파싱 제거
+- 우선 주요 테스트 종목은 고정 매핑으로 처리
 
 ## Render 환경변수
+- DART_API_KEY
 
-Render > Environment 에서 아래 값을 추가하세요.
-
-- `DART_API_KEY` : OpenDART에서 발급받은 API 키
-
-## 테스트 주소
-
-배포 후 아래 주소를 열어보세요.
-
-- `/health`
-- `/stock-report?name=삼천당제약`
-
-## 주의
-
-- 네이버증권/뉴스/디시 검색은 개인 스터디용 참고 데이터입니다.
-- DART 데이터는 회사별 계정명 차이 때문에 일부 항목이 `확인 불가`로 표시될 수 있습니다.
+## 테스트
+- /health
+- /stock-report?name=삼성전자
+- /stock-report?name=삼천당제약

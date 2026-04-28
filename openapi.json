@@ -2,12 +2,12 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Korean Stock Quick Study API",
-    "description": "한국 주식 종목명을 받아 DART, 네이버증권, 뉴스/커뮤니티 기반 퀵 스터디 데이터를 반환합니다.",
-    "version": "1.0.0"
+    "description": "한국 주식 종목명을 받아 퀵 스터디용 데이터를 반환합니다.",
+    "version": "1.1.0"
   },
   "servers": [
     {
-      "url": "https://YOUR-RENDER-URL.onrender.com"
+      "url": "https://stock-quick-study-api.onrender.com"
     }
   ],
   "paths": {
@@ -39,7 +39,7 @@
         ],
         "responses": {
           "200": {
-            "description": "종목 리포트 데이터",
+            "description": "종목 데이터",
             "content": {
               "application/json": {
                 "schema": {
