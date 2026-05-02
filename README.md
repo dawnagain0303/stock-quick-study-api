@@ -1,9 +1,10 @@
-# stock-quick-study-api v1.6 fnguide linear
+# stock-quick-study-api v1.7 fnguide row
 
 수정 사항:
 - FnGuide Financial Highlight 연간 컨센서스 파싱 개선
-- HTML table 구조가 깨져도 화면 텍스트 순서 기반으로 연간 블록 파싱
-- 2025/12(E), 2026/12(E), 2027/12(E) 같은 향후 추정치 컬럼 매칭 강화
+- 연도 헤더를 먼저 추출하고, 각 tr의 td 숫자값을 행 이름 기준으로 직접 매칭
+- 매출액/영업이익/당기순이익/지배주주순이익/EPS/BPS/PER/PBR/ROE 지원
+- debug_rows_sample 추가
 
 환경변수:
 - DART_API_KEY

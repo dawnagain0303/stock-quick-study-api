@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.6.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="1.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v1.6-fnguide-linear"
+        "version": "v1.7-fnguide-row"
     }
 
 
@@ -289,11 +289,12 @@ def parse_table_number(text: str):
 
 def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     """
-    CompanyGuide Financial Highlight - 연간 텍스트 순서 기반 파싱 v1.6.
-    이유:
-    - FnGuide는 화면상 표처럼 보여도 HTML에서 행명/값이 분리되어 잡히는 경우가 있음.
-    - 따라서 BeautifulSoup 테이블 파싱 + 텍스트 라인 파싱을 병행.
-    - 특히 Financial Highlight > IFRS(연결) > Annual 블록 중 2025/12(E), 2026/12(E), 2027/12(E)가 있는 블록을 우선 선택.
+    CompanyGuide Financial Highlight - 행/열 직접 매칭 v1.7.
+    핵심:
+    - highlight_D_A 안의 table에서 연도 헤더(20xx/12(E))를 먼저 뽑음
+    - 각 tr에서 매출액/영업이익/당기순이익/EPS/PER/PBR 행을 찾음
+    - 같은 행의 td 숫자값을 연도 헤더 순서에 맞춰 매칭
+    - 값 개수가 연도보다 많거나 적어도 오른쪽 정렬/보정
     """
     gicode = "A" + stock_code
     url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode={gicode}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701"
@@ -306,266 +307,218 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         "Connection": "keep-alive",
     }
 
-    metric_map = {
-        "매출액": "revenue",
-        "영업이익": "operating_income",
-        "당기순이익": "net_income",
-        "지배주주순이익": "controlling_net_income",
-        "EPS": "eps",
-        "BPS": "bps",
-        "PER": "per",
-        "PBR": "pbr",
-        "ROE": "roe",
-        "부채비율": "debt_ratio",
-        "영업이익률": "operating_margin"
-    }
+    metric_map = [
+        ("지배주주순이익", "controlling_net_income"),
+        ("당기순이익", "net_income"),
+        ("영업이익률", "operating_margin"),
+        ("영업이익", "operating_income"),
+        ("매출액", "revenue"),
+        ("부채비율", "debt_ratio"),
+        ("EPS", "eps"),
+        ("BPS", "bps"),
+        ("PER", "per"),
+        ("PBR", "pbr"),
+        ("ROE", "roe")
+    ]
 
-    def normalize(s):
+    def norm(s):
         return re.sub(r"\s+", "", str(s or "")).strip()
 
-    def line_values(s):
-        """
-        한 줄에서 숫자/N/A들을 순서대로 추출.
-        예: '29,840 30,947 35,101 ...' -> [29840, 30947, 35101, ...]
-        """
-        tokens = re.findall(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", str(s))
-        return [parse_table_number(t) for t in tokens]
+    def parse_num(s):
+        return parse_table_number(str(s))
 
-    def year_info_from_line(s):
-        m = re.search(r"(20\d{2})/\d{2}(\(E\))?", str(s))
-        if not m:
+    def year_labels_from_text(txt):
+        # 2025/12, 2025/12(E) 형태만 추출
+        labels = re.findall(r"20\d{2}/\d{2}(?:\(E\))?", str(txt))
+        out = []
+        seen = set()
+        for lab in labels:
+            if lab not in seen:
+                seen.add(lab)
+                out.append(lab)
+        return out
+
+    def make_year_rows(labels):
+        rows = []
+        for lab in labels:
+            m = re.search(r"(20\d{2})", lab)
+            if not m:
+                continue
+            rows.append({
+                "year": int(m.group(1)),
+                "label": lab,
+                "is_estimate": ("E" in lab or "e" in lab)
+            })
+        return rows
+
+    def numeric_values_from_cells(cells):
+        vals = []
+        for c in cells:
+            txt = c.get_text(" ", strip=True)
+            v = parse_num(txt)
+            if v is not None:
+                vals.append(v)
+        return vals
+
+    def numeric_values_from_text(txt):
+        tokens = re.findall(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", str(txt))
+        vals = []
+        for t in tokens:
+            v = parse_num(t)
+            if v is not None:
+                vals.append(v)
+        return vals
+
+    def align_values(vals, n):
+        if not vals or n <= 0:
+            return []
+        if len(vals) == n:
+            return vals
+        if len(vals) > n:
+            # 행 이름 쪽에 불필요 숫자가 섞였을 가능성이 있어 오른쪽 n개 우선
+            return vals[-n:]
+        # 값이 부족하면 앞쪽을 None으로 채움
+        return [None] * (n - len(vals)) + vals
+
+    def parse_table(table, table_name):
+        table_text = table.get_text(" ", strip=True)
+        labels = year_labels_from_text(table_text)
+
+        # FnGuide 연간표는 보통 6~8개 연도. 너무 많으면 중복/분기 섞임 가능성이 있으므로 뒤쪽 8개까지.
+        if len(labels) > 8:
+            labels = labels[-8:]
+
+        years = make_year_rows(labels)
+        if len(years) < 3:
             return None
-        label = str(s).strip()
-        return {
-            "year": int(m.group(1)),
-            "label": label,
-            "is_estimate": ("E" in label or "e" in label or "추정" in label)
-        }
 
-    def build_from_lines(lines, start_idx, end_idx):
-        block = lines[start_idx:end_idx]
-        years = []
-        for ln in block:
-            yi = year_info_from_line(ln)
-            if yi:
-                # 중복 방지: 같은 label은 한 번만
-                if not any(y["label"] == yi["label"] for y in years):
-                    years.append(yi)
-
-        # annual block은 5~8개 연도, 추정치 1~3개 이상이어야 후보
-        if len(years) < 4:
-            return None
-
-        data_by_year = {}
-        for y in years:
-            data_by_year[str(y["year"]) + "|" + y["label"]] = dict(y)
-
-        # metric 라인 다음에 나오는 숫자 라인을 찾아 매핑
-        matched = 0
+        data = {i: dict(years[i]) for i in range(len(years))}
+        matched_rows = 0
         value_count = 0
+        debug_rows = []
 
-        for i, ln in enumerate(block):
-            nln = normalize(ln)
+        trs = table.select("tr")
+        for ri, tr in enumerate(trs):
+            row_text = tr.get_text(" ", strip=True)
+            row_norm = norm(row_text)
+
             matched_key = None
-
-            for kor, eng in metric_map.items():
-                nk = normalize(kor)
-                # 너무 넓게 잡지 않기: PER/PBR/EPS/BPS/ROE는 정확히 포함, 영업이익은 발표기준 제외
-                if nk in nln:
-                    if kor == "영업이익" and "발표기준" in nln:
+            matched_label = None
+            for kor, eng in metric_map:
+                if norm(kor) in row_norm:
+                    # '영업이익(발표기준)'은 보조항목이라 제외
+                    if kor == "영업이익" and "발표기준" in row_norm:
                         continue
                     matched_key = eng
+                    matched_label = kor
                     break
 
             if not matched_key:
                 continue
 
-            # 같은 줄에 숫자가 있으면 사용, 아니면 아래 최대 3줄 탐색
-            vals = line_values(ln)
+            # 같은 tr의 td 값 우선. th는 보통 행명이라 제외.
+            td_vals = numeric_values_from_cells(tr.select("td"))
+
+            # td가 없거나 부족하면 row_text 전체 숫자에서 추출
+            vals = td_vals
             if len(vals) < len(years):
-                for j in range(i + 1, min(i + 5, len(block))):
-                    cand = line_values(block[j])
-                    if len(cand) >= len(years):
-                        vals = cand
+                vals = numeric_values_from_text(row_text)
+
+            # 그래도 부족하면 다음 행 숫자까지 보조 확인
+            if len(vals) < len(years):
+                for sib in tr.find_next_siblings("tr", limit=3):
+                    sib_vals = numeric_values_from_cells(sib.select("td"))
+                    if len(sib_vals) >= len(years):
+                        vals = sib_vals
                         break
 
-            if len(vals) < len(years):
+            vals = align_values(vals, len(years))
+            if len(vals) != len(years):
                 continue
 
-            matched += 1
-            # 값이 연도보다 많으면 앞에서부터 연도 개수만 사용
-            vals = vals[:len(years)]
-            for y, v in zip(years, vals):
-                key = str(y["year"]) + "|" + y["label"]
-                data_by_year[key][matched_key] = v
+            matched_rows += 1
+            debug_rows.append({"row_index": ri, "label": matched_label, "raw": row_text[:120], "values": vals})
+
+            for i, v in enumerate(vals):
+                data[i][matched_key] = v
                 if v is not None:
                     value_count += 1
 
-        annual_all = [data_by_year[k] for k in data_by_year.keys()]
-        # year/label 기준 정렬
-        annual_all.sort(key=lambda x: (x.get("year", 0), x.get("label", "")))
+        if matched_rows == 0 or value_count == 0:
+            return None
+
+        annual_all = [data[i] for i in range(len(years))]
         annual_estimates = [x for x in annual_all if x.get("is_estimate")]
 
-        if matched == 0 or value_count == 0:
-            return None
+        # E 표시가 없는 경우 현재연도 이후를 추정치 후보로 분류
+        if not annual_estimates:
+            current_year = dt.date.today().year
+            annual_estimates = [x for x in annual_all if x.get("year", 0) >= current_year]
+            for x in annual_estimates:
+                x["is_estimate"] = True
+                x["estimate_reason"] = "E 표시는 없지만 현재연도 이후 컬럼이라 추정치 후보로 분류"
 
         return {
             "status": "ok" if annual_estimates else "no_estimate_columns_found",
             "source": url,
-            "parser": "financial_highlight_linear_text",
+            "parser": "financial_highlight_row_cell",
+            "table_name": table_name,
             "unit_note": "CompanyGuide Financial Highlight 표 기준. 매출/영업이익/순이익은 억원, EPS/BPS는 원, PER/PBR은 배, ROE는 %",
             "annual_all": annual_all,
             "annual_estimates": annual_estimates,
-            "matched_rows": matched,
+            "matched_rows": matched_rows,
             "value_count": value_count,
-            "note": "개인 스터디용 참고. Financial Highlight 연간 텍스트 블록 파싱"
+            "debug_rows_sample": debug_rows[:5],
+            "note": "개인 스터디용 참고. Financial Highlight 연간표의 행/열 직접 매칭"
         }
-
-    def parse_by_linear_text(soup):
-        # 줄 단위로 정리
-        lines = [x.strip() for x in soup.get_text("\n", strip=True).split("\n") if x.strip()]
-        blocks = []
-
-        # Financial Highlight가 시작되는 지점들을 후보로 잡음
-        fh_indices = [i for i, x in enumerate(lines) if normalize(x) == "FinancialHighlight"]
-        for idx, start in enumerate(fh_indices):
-            end = fh_indices[idx + 1] if idx + 1 < len(fh_indices) else len(lines)
-            block_lines = lines[start:end]
-            btxt = "\n".join(block_lines)
-
-            # 연결 + Annual 포함 블록만 우선
-            if "IFRS(연결)" not in btxt or "Annual" not in btxt:
-                continue
-
-            parsed = build_from_lines(lines, start, end)
-            if parsed:
-                est_count = len(parsed.get("annual_estimates", []))
-                max_year = max([x.get("year", 0) for x in parsed.get("annual_all", [])] or [0])
-                parsed["block_start_line"] = start
-                parsed["block_end_line"] = end
-                parsed["estimate_count"] = est_count
-                parsed["max_year"] = max_year
-                blocks.append(parsed)
-
-        if not blocks:
-            return None
-
-        # 추정치가 많고, 미래연도가 멀리 있는 Annual 블록 우선
-        blocks.sort(key=lambda x: (x.get("estimate_count", 0), x.get("max_year", 0), x.get("value_count", 0)), reverse=True)
-        return blocks[0]
-
-    def parse_by_table_fallback(soup):
-        # 기존 table 기반 보조 파서: 값이 같은 행에 있을 때만 작동
-        def get_cells(tr):
-            return [c.get_text(" ", strip=True) for c in tr.select("th,td")]
-
-        candidates = []
-        for ti, table in enumerate(soup.select("table")):
-            trs = table.select("tr")
-            matrix = [get_cells(tr) for tr in trs]
-            matrix = [row for row in matrix if row]
-            if len(matrix) < 3:
-                continue
-
-            text = normalize(table.get_text(" ", strip=True))
-            if "매출액" not in text or "영업이익" not in text:
-                continue
-
-            header_idx = None
-            best_cnt = 0
-            for i, row in enumerate(matrix[:8]):
-                cnt = sum(1 for c in row if re.search(r"20\d{2}/\d{2}", c))
-                if cnt > best_cnt:
-                    best_cnt = cnt
-                    header_idx = i
-            if header_idx is None or best_cnt < 3:
-                continue
-
-            headers = matrix[header_idx]
-            years = []
-            for idx, h in enumerate(headers):
-                yi = year_info_from_line(h)
-                if yi:
-                    yi["idx"] = idx
-                    years.append(yi)
-            if len(years) < 3:
-                continue
-
-            data = {}
-            for y in years:
-                data[str(y["year"]) + "|" + y["label"]] = {k: v for k, v in y.items() if k != "idx"}
-
-            matched = 0
-            value_count = 0
-            for row in matrix[header_idx + 1:]:
-                row_name = normalize(row[0]) if row else ""
-                mkey = None
-                for kor, eng in metric_map.items():
-                    if normalize(kor) in row_name:
-                        if kor == "영업이익" and "발표기준" in row_name:
-                            continue
-                        mkey = eng
-                        break
-                if not mkey:
-                    continue
-                matched += 1
-                for y in years:
-                    idx = y["idx"]
-                    if idx < len(row):
-                        val = parse_table_number(row[idx])
-                        data[str(y["year"]) + "|" + y["label"]][mkey] = val
-                        if val is not None:
-                            value_count += 1
-
-            if matched and value_count:
-                annual_all = list(data.values())
-                annual_all.sort(key=lambda x: (x.get("year", 0), x.get("label", "")))
-                annual_estimates = [x for x in annual_all if x.get("is_estimate")]
-                candidates.append({
-                    "status": "ok" if annual_estimates else "no_estimate_columns_found",
-                    "source": url,
-                    "parser": "table_fallback",
-                    "table_index": ti,
-                    "unit_note": "CompanyGuide Financial Highlight 표 기준",
-                    "annual_all": annual_all,
-                    "annual_estimates": annual_estimates,
-                    "matched_rows": matched,
-                    "value_count": value_count
-                })
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: (len(x.get("annual_estimates", [])), x.get("value_count", 0)), reverse=True)
-        return candidates[0]
 
     try:
         r = requests.get(url, headers=headers, timeout=15)
         r.encoding = r.apparent_encoding or "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
+        full_text = soup.get_text(" ", strip=True)
 
         debug = {
             "url": url,
             "html_len": len(r.text),
             "table_count": len(soup.select("table")),
-            "financial_highlight_count": soup.get_text(" ", strip=True).count("Financial Highlight"),
-            "contains_2027_est": "2027/12(E)" in r.text or "2027/12(E)" in soup.get_text(" ", strip=True)
+            "has_highlight_D_A": bool(soup.select_one("#highlight_D_A")),
+            "contains_2027_est": "2027/12(E)" in full_text or "2027/12(E)" in r.text,
+            "year_labels_sample": year_labels_from_text(full_text)[:12]
         }
 
-        parsed = parse_by_linear_text(soup)
-        if not parsed:
-            parsed = parse_by_table_fallback(soup)
+        candidates = []
 
-        if parsed:
-            parsed["debug_summary"] = debug
-            return parsed
+        # 1순위: Financial Highlight 연간 영역 id
+        annual_div = soup.select_one("#highlight_D_A")
+        if annual_div:
+            for i, table in enumerate(annual_div.select("table")):
+                parsed = parse_table(table, f"highlight_D_A_table_{i}")
+                if parsed:
+                    candidates.append(parsed)
 
-        return {
-            "status": "확인 불가",
-            "annual_all": [],
-            "annual_estimates": [],
-            "note": "Financial Highlight 연간 블록은 확인했으나 매출액/영업이익 등 값 매칭 실패",
-            "debug": debug
-        }
+        # 2순위: Financial Highlight 주변 전체에서 후보
+        if not candidates:
+            for i, table in enumerate(soup.select("table")):
+                t = norm(table.get_text(" ", strip=True))
+                if ("매출액" in t and "영업이익" in t and "PER" in t) or ("FinancialHighlight" in t and "매출액" in t):
+                    parsed = parse_table(table, f"all_table_{i}")
+                    if parsed:
+                        candidates.append(parsed)
+
+        if not candidates:
+            return {
+                "status": "확인 불가",
+                "annual_all": [],
+                "annual_estimates": [],
+                "note": "Financial Highlight 표는 확인했으나 행/열 숫자 매칭 실패",
+                "debug": debug
+            }
+
+        candidates.sort(key=lambda x: (len(x.get("annual_estimates", [])), x.get("value_count", 0), x.get("matched_rows", 0)), reverse=True)
+        best = candidates[0]
+        best["debug_summary"] = debug
+        return best
 
     except Exception as e:
         return {
