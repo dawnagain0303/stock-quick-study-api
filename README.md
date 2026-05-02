@@ -1,10 +1,10 @@
-# stock-quick-study-api v1.4 fnguide robust
+# stock-quick-study-api v1.5 fnguide highlight
 
 수정 사항:
-- CompanyGuide/FnGuide 컨센서스 파싱 개선
-- 모든 table을 스캔해 Financial Highlight 후보를 찾음
-- E 표시가 없으면 현재연도 이후 컬럼을 추정치 후보로 분류
-- debug_summary 추가
+- CompanyGuide Financial Highlight 연간표(div id=highlight_D_A) 직접 파싱
+- 실패 시 highlight 영역/전체 테이블 보조 스캔
+- annual_estimates에 향후 추정치(E) 컬럼 반환
+- debug_summary에 highlight_D_A 탐지 여부 표시
 
 환경변수:
 - DART_API_KEY
