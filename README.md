@@ -1,10 +1,9 @@
-# stock-quick-study-api v1.5 fnguide highlight
+# stock-quick-study-api v1.6 fnguide linear
 
 수정 사항:
-- CompanyGuide Financial Highlight 연간표(div id=highlight_D_A) 직접 파싱
-- 실패 시 highlight 영역/전체 테이블 보조 스캔
-- annual_estimates에 향후 추정치(E) 컬럼 반환
-- debug_summary에 highlight_D_A 탐지 여부 표시
+- FnGuide Financial Highlight 연간 컨센서스 파싱 개선
+- HTML table 구조가 깨져도 화면 텍스트 순서 기반으로 연간 블록 파싱
+- 2025/12(E), 2026/12(E), 2027/12(E) 같은 향후 추정치 컬럼 매칭 강화
 
 환경변수:
 - DART_API_KEY
