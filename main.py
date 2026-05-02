@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.3.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v1.3-fnguide"
+        "version": "v1.4-fnguide-robust"
     }
 
 
@@ -289,14 +289,17 @@ def parse_table_number(text: str):
 
 def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     """
-    CompanyGuide Financial Highlight 표 파싱.
-    값 단위는 페이지 표기 기준: 매출/영업이익/순이익은 보통 억원, EPS/BPS는 원, PER/PBR은 배, ROE는 %.
+    CompanyGuide/FnGuide Financial Highlight 표 파싱 개선판.
+    - table id/class에 의존하지 않고 모든 table을 스캔
+    - 헤더가 thead에 있거나 tbody 첫 행에 있거나 멀티헤더여도 최대한 연도 컬럼 탐색
+    - E가 없어도 최근 미래연도 컬럼이 있으면 estimates 후보로 반환
     """
     gicode = "A" + stock_code
     urls = [
         f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode={gicode}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701",
         f"https://comp.fnguide.com/SVO2/ASP/SVD_Finance.asp?pGB=1&gicode={gicode}&cID=&MenuYn=Y&ReportGB=&NewMenuID=103&stkGb=701"
     ]
+
     wanted = {
         "매출액": "revenue",
         "영업이익": "operating_income",
@@ -306,89 +309,143 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         "BPS": "bps",
         "PER": "per",
         "PBR": "pbr",
-        "ROE": "roe"
+        "ROE": "roe",
+        "부채비율": "debt_ratio",
+        "영업이익률": "operating_margin"
     }
+
+    def normalize(s):
+        return re.sub(r"\s+", "", str(s or "")).strip()
+
+    def row_cells(tr):
+        return [c.get_text(" ", strip=True) for c in tr.select("th,td")]
+
     last_error = None
+    debug = []
+
     for url in urls:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
+            r = requests.get(url, headers={**HEADERS, "Referer": "https://finance.naver.com/"}, timeout=15)
             r.encoding = r.apparent_encoding or "utf-8"
             soup = BeautifulSoup(r.text, "html.parser")
             tables = soup.select("table")
-            best = None
-            best_score = 0
-            for table in tables:
-                txt = table.get_text(" ", strip=True)
-                score = sum(1 for k in wanted.keys() if k in txt)
-                if score > best_score:
-                    best_score = score
-                    best = table
-            if not best or best_score < 3:
-                continue
+            debug.append({"url": url, "table_count": len(tables), "html_len": len(r.text)})
 
-            rows = best.select("tr")
-            if not rows:
-                continue
+            best_result = None
+            best_score = -1
 
-            header_cells = [c.get_text(" ", strip=True) for c in rows[0].select("th,td")]
-            if len(header_cells) < 2 and len(rows) > 1:
-                header_cells = [c.get_text(" ", strip=True) for c in rows[1].select("th,td")]
-
-            year_cols = []
-            for idx, h in enumerate(header_cells):
-                if re.search(r"20\d{2}", h):
-                    year_cols.append((idx, h))
-            if not year_cols:
-                continue
-
-            data_by_year = {}
-            for idx, h in year_cols:
-                y = re.search(r"(20\d{2})", h)
-                if y:
-                    year = y.group(1)
-                    data_by_year[year] = {"year": int(year), "label": h, "is_estimate": ("E" in h or "e" in h)}
-
-            for tr in rows[1:]:
-                cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
-                if len(cells) < 2:
+            for table_idx, table in enumerate(tables):
+                trs = table.select("tr")
+                if len(trs) < 3:
                     continue
-                row_name = cells[0].replace(" ", "")
-                matched_key = None
-                for kor, eng in wanted.items():
-                    if kor.replace(" ", "") in row_name:
-                        matched_key = eng
-                        break
-                if not matched_key:
-                    continue
-                for idx, h in year_cols:
-                    if idx < len(cells):
-                        y = re.search(r"(20\d{2})", h)
-                        if y:
-                            year = y.group(1)
-                            data_by_year.setdefault(year, {"year": int(year), "label": h, "is_estimate": ("E" in h or "e" in h)})
-                            data_by_year[year][matched_key] = parse_table_number(cells[idx])
 
-            annual_all = [data_by_year[k] for k in sorted(data_by_year.keys())]
-            annual_estimates = [x for x in annual_all if x.get("is_estimate")]
-            return {
-                "status": "ok" if annual_estimates else "no_estimate_columns_found",
-                "source": url,
-                "unit_note": "CompanyGuide 표 기준. 매출/영업이익/순이익은 통상 억원, EPS/BPS는 원, PER/PBR은 배, ROE는 %",
-                "annual_all": annual_all,
-                "annual_estimates": annual_estimates,
-                "note": "개인 스터디용 참고. 종목별 표 구조 변경 시 일부 항목 누락 가능"
-            }
+                matrix = [row_cells(tr) for tr in trs]
+                table_text = normalize(table.get_text(" ", strip=True))
+                label_score = sum(1 for k in wanted if normalize(k) in table_text)
+                year_score = len(re.findall(r"20\d{2}", table_text))
+                score = label_score * 10 + year_score
+
+                if label_score < 2 or year_score < 2:
+                    continue
+
+                # 헤더 후보: 연도가 가장 많이 들어간 행
+                header_idx = None
+                max_years = 0
+                for i, cells in enumerate(matrix[:5]):
+                    cnt = sum(1 for c in cells if re.search(r"20\d{2}", c))
+                    if cnt > max_years:
+                        max_years = cnt
+                        header_idx = i
+
+                if header_idx is None or max_years == 0:
+                    continue
+
+                headers = matrix[header_idx]
+                year_cols = []
+                for idx, h in enumerate(headers):
+                    m = re.search(r"(20\d{2})", h)
+                    if m:
+                        year_cols.append((idx, h, int(m.group(1))))
+
+                if not year_cols:
+                    continue
+
+                data_by_year = {}
+                for idx, label, year in year_cols:
+                    data_by_year[str(year)] = {
+                        "year": year,
+                        "label": label,
+                        "is_estimate": ("E" in label or "e" in label or "추정" in label)
+                    }
+
+                for cells in matrix[header_idx + 1:]:
+                    if len(cells) < 2:
+                        continue
+                    row_name_raw = cells[0]
+                    row_name = normalize(row_name_raw)
+
+                    matched_key = None
+                    for kor, eng in wanted.items():
+                        if normalize(kor) in row_name:
+                            matched_key = eng
+                            break
+                    if not matched_key:
+                        continue
+
+                    for idx, label, year in year_cols:
+                        if idx < len(cells):
+                            data_by_year[str(year)][matched_key] = parse_table_number(cells[idx])
+
+                annual_all = [data_by_year[k] for k in sorted(data_by_year.keys())]
+
+                # E 표시가 있는 컬럼 우선
+                annual_estimates = [x for x in annual_all if x.get("is_estimate")]
+
+                # E 표시가 없으면 현재연도 이후/최근 미래연도 후보를 추정치 후보로 처리
+                if not annual_estimates:
+                    current_year = dt.date.today().year
+                    annual_estimates = [x for x in annual_all if x.get("year", 0) >= current_year]
+                    for x in annual_estimates:
+                        x["is_estimate"] = True
+                        x["estimate_reason"] = "E 표시는 없지만 현재연도 이후 컬럼이라 추정치 후보로 분류"
+
+                found_values = sum(
+                    1 for row in annual_all
+                    for k in ["revenue", "operating_income", "net_income", "eps", "per", "pbr"]
+                    if row.get(k) is not None
+                )
+                total_score = score + found_values
+
+                candidate = {
+                    "status": "ok" if annual_estimates else "no_estimate_columns_found",
+                    "source": url,
+                    "table_index": table_idx,
+                    "unit_note": "CompanyGuide 표 기준. 매출/영업이익/순이익은 통상 억원, EPS/BPS는 원, PER/PBR은 배, ROE는 %",
+                    "annual_all": annual_all,
+                    "annual_estimates": annual_estimates,
+                    "note": "개인 스터디용 참고. 종목별 표 구조 변경 시 일부 항목 누락 가능"
+                }
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_result = candidate
+
+            if best_result:
+                best_result["debug_summary"] = debug[-1]
+                return best_result
+
         except Exception as e:
             last_error = str(e)
             continue
+
     return {
         "status": "확인 불가",
         "annual_all": [],
         "annual_estimates": [],
         "note": "CompanyGuide/FnGuide Financial Highlight 표 파싱 실패 또는 컨센서스 미제공 종목",
-        "error": last_error
+        "error": last_error,
+        "debug": debug
     }
-
 
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
     try:
