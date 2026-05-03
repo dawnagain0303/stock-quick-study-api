@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.9.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v1.9-fnguide-encoding-lines"
+        "version": "v2.0-order-backlog"
     }
 
 
@@ -565,6 +565,375 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
             "error": str(e)
         }
 
+
+def dart_list_latest_regular_report(corp_code: str) -> Dict[str, Any]:
+    """
+    DART 공시목록에서 최신 정기보고서(사업/반기/분기)를 찾는다.
+    """
+    if not DART_API_KEY or not corp_code:
+        return {"status": "확인 불가", "note": "DART_API_KEY 또는 corp_code 없음"}
+
+    try:
+        today = dt.date.today()
+        bgn_de = (today - dt.timedelta(days=900)).strftime("%Y%m%d")
+        end_de = today.strftime("%Y%m%d")
+        url = "https://opendart.fss.or.kr/api/list.json"
+        params = {
+            "crtfc_key": DART_API_KEY,
+            "corp_code": corp_code,
+            "bgn_de": bgn_de,
+            "end_de": end_de,
+            "page_no": 1,
+            "page_count": 100
+        }
+        js = requests.get(url, params=params, timeout=15).json()
+        if js.get("status") != "000":
+            return {"status": "확인 불가", "note": js.get("message", "DART list 조회 실패")}
+
+        items = []
+        for it in js.get("list", []):
+            rn = it.get("report_nm", "")
+            if any(k in rn for k in ["사업보고서", "반기보고서", "분기보고서"]):
+                # 정정 보고서도 최신이면 허용하되 첨부정정 등 이상한 것은 제외
+                items.append({
+                    "rcept_no": it.get("rcept_no"),
+                    "report_nm": rn,
+                    "rcept_dt": it.get("rcept_dt"),
+                    "corp_name": it.get("corp_name")
+                })
+
+        if not items:
+            return {"status": "확인 불가", "note": "최근 900일 내 정기보고서 없음"}
+
+        items.sort(key=lambda x: x.get("rcept_dt", ""), reverse=True)
+        latest = items[0]
+        latest["status"] = "ok"
+        return latest
+
+    except Exception as e:
+        return {"status": "확인 불가", "note": "DART 공시목록 조회 중 오류", "error": str(e)}
+
+
+def dart_download_document_xml(rcept_no: str) -> Dict[str, Any]:
+    """
+    DART document.xml로 보고서 원문 zip을 받아 텍스트/테이블 탐색용 soup 목록을 만든다.
+    """
+    if not DART_API_KEY or not rcept_no:
+        return {"status": "확인 불가", "note": "DART_API_KEY 또는 rcept_no 없음", "docs": []}
+
+    try:
+        url = "https://opendart.fss.or.kr/api/document.xml"
+        r = requests.get(url, params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no}, timeout=25)
+
+        # 에러는 XML 텍스트로 오는 경우가 있음
+        if r.content[:5] != b"PK\x03\x04":
+            try:
+                msg = r.content.decode("utf-8", errors="replace")[:500]
+            except Exception:
+                msg = str(r.content[:200])
+            return {"status": "확인 불가", "note": "DART document 다운로드 실패", "raw": msg, "docs": []}
+
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        docs = []
+        for name in z.namelist():
+            if not name.lower().endswith((".xml", ".html", ".htm")):
+                continue
+            raw = z.read(name)
+            html = None
+            for enc in ["utf-8", "cp949", "euc-kr"]:
+                try:
+                    html = raw.decode(enc)
+                    break
+                except Exception:
+                    continue
+            if html is None:
+                html = raw.decode("utf-8", errors="replace")
+
+            soup = BeautifulSoup(html, "html.parser")
+            docs.append({
+                "filename": name,
+                "html_len": len(html),
+                "soup": soup
+            })
+
+        return {"status": "ok", "docs": docs, "file_count": len(docs)}
+
+    except Exception as e:
+        return {"status": "확인 불가", "note": "DART document 원문 처리 중 오류", "error": str(e), "docs": []}
+
+
+def normalize_backlog_text(s: Any) -> str:
+    return re.sub(r"\s+", "", str(s or "").replace("\xa0", " "))
+
+
+def table_to_matrix(table) -> List[List[str]]:
+    matrix = []
+    for tr in table.select("tr"):
+        row = []
+        for cell in tr.select("th,td"):
+            txt = cell.get_text(" ", strip=True)
+            if txt:
+                row.append(txt)
+            else:
+                row.append("")
+        if any(x.strip() for x in row):
+            matrix.append(row)
+    return matrix
+
+
+def parse_money_like(value: str):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s in ["", "-", "N/A", "해당사항 없음", "해당사항없음"]:
+        return None
+    # 괄호 음수, 쉼표, 소수 대응
+    neg = s.startswith("(") and s.endswith(")")
+    if neg:
+        s = s[1:-1]
+    cleaned = re.sub(r"[^0-9.\-]", "", s)
+    if cleaned in ["", "-", "."]:
+        return None
+    try:
+        v = float(cleaned)
+        if neg:
+            v = -v
+        return int(v) if v.is_integer() else v
+    except Exception:
+        return None
+
+
+def detect_unit_near_text(text: str) -> Optional[str]:
+    candidates = [
+        "단위: 백만원", "단위 : 백만원", "단위:백만원",
+        "단위: 천원", "단위 : 천원", "단위:천원",
+        "단위: 원", "단위 : 원", "단위:원",
+        "단위: 억원", "단위 : 억원", "단위:억원",
+        "백만원", "천원", "억원"
+    ]
+    for c in candidates:
+        if c in text:
+            if "백만원" in c:
+                return "백만원"
+            if "천원" in c:
+                return "천원"
+            if "억원" in c:
+                return "억원"
+            if "원" in c:
+                return "원"
+    return None
+
+
+def score_order_backlog_table(matrix: List[List[str]], context_text: str) -> int:
+    text = normalize_backlog_text(" ".join([" ".join(r) for r in matrix]) + " " + context_text)
+    score = 0
+    keywords = {
+        "수주상황": 60,
+        "수주잔고": 90,
+        "수주총액": 50,
+        "기초수주잔고": 50,
+        "기말수주잔고": 80,
+        "계약잔액": 80,
+        "잔여계약": 80,
+        "미이행수행의무": 90,
+        "이행되지않은수행의무": 90,
+        "수주액": 30,
+        "납품액": 30,
+        "매출액": 10
+    }
+    for k, pts in keywords.items():
+        if k in text:
+            score += pts
+    # 숫자가 많을수록 표일 가능성 증가
+    num_count = sum(1 for row in matrix for cell in row if parse_money_like(cell) is not None)
+    score += min(num_count, 30)
+    # 너무 작은 표는 감점
+    if len(matrix) < 2:
+        score -= 50
+    return score
+
+
+def extract_context_around_table(table, chars: int = 500) -> str:
+    parts = []
+    # 이전 형제 몇 개
+    prevs = []
+    p = table
+    for _ in range(8):
+        p = p.find_previous()
+        if not p:
+            break
+        if p.name in ["p", "div", "span", "title", "section", "h1", "h2", "h3", "h4"]:
+            txt = p.get_text(" ", strip=True)
+            if txt:
+                prevs.append(txt)
+    parts.extend(reversed(prevs[-5:]))
+    parts.append(table.get_text(" ", strip=True)[:chars])
+    return " ".join(parts)[-chars:]
+
+
+def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> Dict[str, Any]:
+    """
+    다양한 수주잔고 표를 일반화해서 반환.
+    정확한 컬럼 매핑이 어려우므로 원본 matrix와 함께 핵심 컬럼 후보를 추출한다.
+    """
+    if not matrix:
+        return {"status": "확인 불가", "note": "빈 표"}
+
+    # 첫 행 또는 앞 2행을 헤더 후보로 사용
+    header = matrix[0]
+    if len(matrix) > 1 and len(matrix[1]) > len(header):
+        # 첫 행이 단일 제목행이면 두 번째 행을 헤더로
+        if len(header) <= 2:
+            header = matrix[1]
+
+    norm_headers = [normalize_backlog_text(h) for h in header]
+
+    # 컬럼 후보
+    col_map = {}
+    for idx, h in enumerate(norm_headers):
+        if any(k in h for k in ["품목", "부문", "사업", "공사", "계약", "프로젝트", "구분"]):
+            col_map.setdefault("category", idx)
+        if any(k in h for k in ["수주총액", "계약금액", "수주액", "총계약"]):
+            col_map.setdefault("order_amount", idx)
+        if any(k in h for k in ["기납품", "납품액", "매출액", "수익인식", "이행금액"]):
+            col_map.setdefault("delivered_amount", idx)
+        if any(k in h for k in ["수주잔고", "기말수주잔고", "잔고", "계약잔액", "미이행", "잔여"]):
+            col_map.setdefault("backlog", idx)
+        if any(k in h for k in ["기간", "연도", "당기", "전기", "기말"]):
+            col_map.setdefault("period", idx)
+
+    items = []
+    start_row = 1
+    if len(matrix) > 1 and header == matrix[1]:
+        start_row = 2
+
+    for row in matrix[start_row:]:
+        if not row or len(row) < 2:
+            continue
+        item = {}
+        for key, idx in col_map.items():
+            if idx < len(row):
+                val = row[idx]
+                if key in ["order_amount", "delivered_amount", "backlog"]:
+                    item[key] = parse_money_like(val)
+                    item[key + "_raw"] = val
+                else:
+                    item[key] = val
+        # 컬럼 매핑 실패 시 행 전체 유지
+        if not item:
+            nums = [parse_money_like(x) for x in row]
+            if any(x is not None for x in nums):
+                item = {"raw_row": row, "numbers": nums}
+        if item:
+            items.append(item)
+
+    # 핵심 backlog 총액 후보: backlog 컬럼 중 마지막/합계/계 행 우선
+    backlog_candidates = []
+    for it in items:
+        if it.get("backlog") is not None:
+            label = normalize_backlog_text(str(it.get("category", "")) + str(it.get("period", "")) + str(it))
+            priority = 0
+            if "합계" in label or "계" == label or "총계" in label:
+                priority += 10
+            backlog_candidates.append((priority, it.get("backlog"), it))
+    backlog_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    return {
+        "unit": unit,
+        "columns_detected": col_map,
+        "items": items[:30],
+        "backlog_best_candidate": backlog_candidates[0][1] if backlog_candidates else None,
+        "backlog_best_row": backlog_candidates[0][2] if backlog_candidates else None,
+        "raw_table_preview": matrix[:12]
+    }
+
+
+def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
+    """
+    최신 정기보고서 원문에서 수주잔고/수주상황/계약잔액/미이행 수행의무 표를 탐색.
+    """
+    latest = dart_list_latest_regular_report(corp_code)
+    if latest.get("status") != "ok":
+        return {
+            "status": "확인 불가",
+            "note": "최신 정기보고서 조회 실패",
+            "latest_report": latest
+        }
+
+    doc = dart_download_document_xml(latest.get("rcept_no"))
+    if doc.get("status") != "ok":
+        return {
+            "status": "확인 불가",
+            "note": "최신 정기보고서 원문 다운로드 실패",
+            "latest_report": latest,
+            "document_status": {k: v for k, v in doc.items() if k != "docs"}
+        }
+
+    keywords = [
+        "수주잔고", "수주상황", "수주총액", "기말수주잔고", "계약잔액",
+        "잔여계약", "미이행 수행의무", "미이행수행의무", "이행되지 않은 수행의무"
+    ]
+
+    candidates = []
+    full_text_hits = []
+
+    for d in doc.get("docs", []):
+        soup = d["soup"]
+        text = soup.get_text(" ", strip=True)
+        norm_text = normalize_backlog_text(text)
+        for kw in keywords:
+            if normalize_backlog_text(kw) in norm_text:
+                full_text_hits.append({"filename": d["filename"], "keyword": kw})
+
+        for ti, table in enumerate(soup.select("table")):
+            matrix = table_to_matrix(table)
+            if not matrix:
+                continue
+            context = extract_context_around_table(table)
+            score = score_order_backlog_table(matrix, context)
+            if score <= 30:
+                continue
+            unit = detect_unit_near_text(context + " " + table.get_text(" ", strip=True))
+            summary = matrix_to_backlog_summary(matrix, unit)
+            candidates.append({
+                "filename": d["filename"],
+                "table_index": ti,
+                "score": score,
+                "context_preview": context[-500:],
+                "summary": summary
+            })
+
+    if not candidates:
+        return {
+            "status": "확인 불가",
+            "note": "정기보고서 원문에서 수주잔고 관련 표를 찾지 못함. 수주산업이 아니거나 표기가 다른 경우일 수 있음.",
+            "latest_report": latest,
+            "keyword_hits": full_text_hits[:20]
+        }
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best = candidates[0]
+
+    return {
+        "status": "ok",
+        "source": "DART document.xml",
+        "latest_report": latest,
+        "matched_table": {
+            "filename": best["filename"],
+            "table_index": best["table_index"],
+            "score": best["score"],
+            "context_preview": best["context_preview"]
+        },
+        "unit": best["summary"].get("unit"),
+        "backlog_best_candidate": best["summary"].get("backlog_best_candidate"),
+        "backlog_best_row": best["summary"].get("backlog_best_row"),
+        "items": best["summary"].get("items"),
+        "columns_detected": best["summary"].get("columns_detected"),
+        "raw_table_preview": best["summary"].get("raw_table_preview"),
+        "other_candidate_count": len(candidates) - 1,
+        "note": "DART 최신 정기보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+    }
+
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
     try:
         q = requests.utils.quote(name)
@@ -597,7 +966,7 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
         "data_basis": {
             "price_market_cap": "네이버증권 일별시세 최신 종가 기준",
             "historical_financials": "DART 사업보고서 기준",
-            "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준",
+            "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
             "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
             "community": "디시인사이드 주식갤러리 검색 참고"
         },
@@ -605,6 +974,7 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
         "weekly_price_summary": weekly_summary(stock_code),
         "historical_financials": historical_financials(corp_code),
         "latest_regular_report": latest_regular_report(corp_code),
+        "order_backlog": fetch_order_backlog(corp_code),
         "consensus": fetch_fnguide_consensus(stock_code),
         "recent_news": naver_news(resolved["name"]),
         "dcinside_community": dcinside_links(resolved["name"]),

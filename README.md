@@ -1,9 +1,10 @@
-# stock-quick-study-api v1.9 fnguide encoding lines
+# stock-quick-study-api v2.0 order backlog
 
 수정 사항:
-- FnGuide 한글 깨짐 방지를 위해 utf-8 강제 디코딩
-- Financial Highlight 연간 블록에서 행명 다음에 숫자가 한 줄씩 나오는 구조 대응
-- 매출액/영업이익/순이익/EPS/PER/PBR 등 행명 다음 n개 숫자를 연도 순서로 매칭
+- 기존 주가/DART 재무/FnGuide 컨센서스 유지
+- DART 최신 정기보고서 원문(document.xml)에서 수주잔고/수주상황/계약잔액/미이행 수행의무 표 탐색
+- order_backlog 필드 추가
+- 회사별 표 구조가 다르므로 결과는 검증 필요
 
 환경변수:
 - DART_API_KEY
