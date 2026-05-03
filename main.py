@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.7.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="1.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v1.7-fnguide-row"
+        "version": "v1.8-fnguide-annual-block"
     }
 
 
@@ -289,12 +289,11 @@ def parse_table_number(text: str):
 
 def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     """
-    CompanyGuide Financial Highlight - 행/열 직접 매칭 v1.7.
+    CompanyGuide Financial Highlight 연간 블록 강제 파싱 v1.8.
     핵심:
-    - highlight_D_A 안의 table에서 연도 헤더(20xx/12(E))를 먼저 뽑음
-    - 각 tr에서 매출액/영업이익/당기순이익/EPS/PER/PBR 행을 찾음
-    - 같은 행의 td 숫자값을 연도 헤더 순서에 맞춰 매칭
-    - 값 개수가 연도보다 많거나 적어도 오른쪽 정렬/보정
+    - Financial Highlight가 여러 번 나오므로, IFRS(연결) + Annual + 2027/12(E)가 있는 블록을 우선 선택
+    - 줄 단위 텍스트에서 연도 헤더 8개를 먼저 잡고, 각 행명 다음 숫자줄을 직접 매칭
+    - 효성중공업처럼 2025/12(E), 2026/12(E), 2027/12(E)가 보이는 케이스 대응
     """
     gicode = "A" + stock_code
     url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode={gicode}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701"
@@ -307,218 +306,246 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         "Connection": "keep-alive",
     }
 
-    metric_map = [
-        ("지배주주순이익", "controlling_net_income"),
-        ("당기순이익", "net_income"),
-        ("영업이익률", "operating_margin"),
-        ("영업이익", "operating_income"),
+    metrics = [
         ("매출액", "revenue"),
-        ("부채비율", "debt_ratio"),
-        ("EPS", "eps"),
-        ("BPS", "bps"),
+        ("영업이익", "operating_income"),
+        ("당기순이익", "net_income"),
+        ("지배주주순이익", "controlling_net_income"),
+        ("영업이익률", "operating_margin"),
+        ("ROE", "roe"),
+        ("EPS(원)", "eps"),
+        ("BPS(원)", "bps"),
         ("PER", "per"),
         ("PBR", "pbr"),
-        ("ROE", "roe")
+        ("부채비율", "debt_ratio")
     ]
 
+    def clean_line(s):
+        return str(s or "").replace("\xa0", " ").strip()
+
     def norm(s):
-        return re.sub(r"\s+", "", str(s or "")).strip()
+        return re.sub(r"\s+", "", clean_line(s))
 
-    def parse_num(s):
-        return parse_table_number(str(s))
+    def extract_num_tokens(line):
+        # N/A도 자리 맞춤용으로 None 처리
+        tokens = re.findall(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", clean_line(line))
+        return [parse_table_number(t) for t in tokens]
 
-    def year_labels_from_text(txt):
-        # 2025/12, 2025/12(E) 형태만 추출
-        labels = re.findall(r"20\d{2}/\d{2}(?:\(E\))?", str(txt))
+    def extract_year_labels(lines):
+        labels = []
+        for ln in lines:
+            m = re.fullmatch(r"20\d{2}/\d{2}(?:\(E\))?", clean_line(ln))
+            if m:
+                lab = m.group(0)
+                if lab not in labels:
+                    labels.append(lab)
+        return labels
+
+    def make_year_records(labels):
         out = []
-        seen = set()
         for lab in labels:
-            if lab not in seen:
-                seen.add(lab)
-                out.append(lab)
+            y = re.search(r"(20\d{2})", lab)
+            if y:
+                out.append({
+                    "year": int(y.group(1)),
+                    "label": lab,
+                    "is_estimate": "E" in lab
+                })
         return out
 
-    def make_year_rows(labels):
-        rows = []
-        for lab in labels:
-            m = re.search(r"(20\d{2})", lab)
-            if not m:
-                continue
-            rows.append({
-                "year": int(m.group(1)),
-                "label": lab,
-                "is_estimate": ("E" in lab or "e" in lab)
+    def find_best_annual_block(lines):
+        # Financial Highlight 시작점들
+        starts = [i for i, ln in enumerate(lines) if norm(ln) == "FinancialHighlight"]
+        blocks = []
+        for idx, s in enumerate(starts):
+            e = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+            block = lines[s:e]
+            txt = "\n".join(block)
+
+            score = 0
+            if "IFRS(연결)" in txt:
+                score += 100
+            if re.search(r"^Annual$", txt, re.MULTILINE):
+                score += 100
+            if "2027/12(E)" in txt:
+                score += 300
+            if "2026/12(E)" in txt:
+                score += 200
+            if "2025/12(E)" in txt:
+                score += 100
+            if "Net Quarter" in txt:
+                score -= 30
+
+            labels = extract_year_labels(block)
+            estimate_count = sum(1 for x in labels if "E" in x)
+            score += estimate_count * 50
+            score += len(labels)
+
+            if "매출액" in txt and "영업이익" in txt and "EPS" in txt:
+                score += 100
+
+            blocks.append({
+                "start": s,
+                "end": e,
+                "score": score,
+                "labels": labels,
+                "estimate_count": estimate_count,
+                "preview": block[:20]
             })
-        return rows
 
-    def numeric_values_from_cells(cells):
-        vals = []
-        for c in cells:
-            txt = c.get_text(" ", strip=True)
-            v = parse_num(txt)
-            if v is not None:
-                vals.append(v)
-        return vals
+        if not blocks:
+            return None
 
-    def numeric_values_from_text(txt):
-        tokens = re.findall(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", str(txt))
-        vals = []
-        for t in tokens:
-            v = parse_num(t)
-            if v is not None:
-                vals.append(v)
-        return vals
+        blocks.sort(key=lambda x: x["score"], reverse=True)
+        return blocks[0]
 
-    def align_values(vals, n):
-        if not vals or n <= 0:
-            return []
-        if len(vals) == n:
-            return vals
-        if len(vals) > n:
-            # 행 이름 쪽에 불필요 숫자가 섞였을 가능성이 있어 오른쪽 n개 우선
-            return vals[-n:]
-        # 값이 부족하면 앞쪽을 None으로 채움
-        return [None] * (n - len(vals)) + vals
+    def row_matches(line, metric_label):
+        nl = norm(line)
+        ml = norm(metric_label)
 
-    def parse_table(table, table_name):
-        table_text = table.get_text(" ", strip=True)
-        labels = year_labels_from_text(table_text)
+        # EPS(원), BPS(원)는 같은 표에서 설명행과 실제 행이 반복되므로 정확 매칭 우선
+        if metric_label in ["EPS(원)", "BPS(원)"]:
+            return nl == norm(metric_label)
 
-        # FnGuide 연간표는 보통 6~8개 연도. 너무 많으면 중복/분기 섞임 가능성이 있으므로 뒤쪽 8개까지.
+        if metric_label in ["PER", "PBR", "ROE"]:
+            return nl == metric_label
+
+        if metric_label == "영업이익":
+            return nl == "영업이익"  # 영업이익(발표기준) 제외
+
+        if metric_label == "부채비율":
+            return nl == "부채비율"
+
+        return ml in nl and len(nl) <= len(ml) + 4
+
+    def parse_block(lines, block_info):
+        block = lines[block_info["start"]:block_info["end"]]
+        labels = block_info["labels"]
+
+        # 너무 많은 라벨이 잡히면 2020~2027(E)처럼 추정 3개 포함된 마지막 8개 우선
+        # 효성중공업 기준: 2020/12~2027/12(E)
         if len(labels) > 8:
             labels = labels[-8:]
 
-        years = make_year_rows(labels)
-        if len(years) < 3:
+        years = make_year_records(labels)
+        if len(years) < 4:
             return None
 
-        data = {i: dict(years[i]) for i in range(len(years))}
-        matched_rows = 0
+        n = len(years)
+        data = [dict(y) for y in years]
+        matched = 0
         value_count = 0
         debug_rows = []
 
-        trs = table.select("tr")
-        for ri, tr in enumerate(trs):
-            row_text = tr.get_text(" ", strip=True)
-            row_norm = norm(row_text)
+        for metric_label, key in metrics:
+            found = False
+            for i, ln in enumerate(block):
+                if not row_matches(ln, metric_label):
+                    continue
 
-            matched_key = None
-            matched_label = None
-            for kor, eng in metric_map:
-                if norm(kor) in row_norm:
-                    # '영업이익(발표기준)'은 보조항목이라 제외
-                    if kor == "영업이익" and "발표기준" in row_norm:
-                        continue
-                    matched_key = eng
-                    matched_label = kor
-                    break
+                # 행명 다음 최대 8줄 안에서 숫자 개수가 연도 수 이상인 줄을 찾음
+                vals = []
+                value_line = None
+                for j in range(i + 1, min(i + 9, len(block))):
+                    cand = extract_num_tokens(block[j])
+                    # 설명문에 있는 100 같은 숫자 방지: 연도 수의 절반 이상 또는 정확히 n개 이상
+                    if len(cand) >= max(3, min(n, 5)):
+                        vals = cand
+                        value_line = block[j]
+                        if len(cand) >= n:
+                            break
 
-            if not matched_key:
-                continue
+                if not vals:
+                    continue
 
-            # 같은 tr의 td 값 우선. th는 보통 행명이라 제외.
-            td_vals = numeric_values_from_cells(tr.select("td"))
+                # 값이 더 많으면 오른쪽 n개가 아니라, 보통 해당 줄이 정확히 n개. 
+                # 혹시 섞이면 마지막 n개보다 '처음 n개'가 연도 순서에 맞는 경우가 많음.
+                if len(vals) >= n:
+                    vals = vals[:n]
+                else:
+                    vals = vals + [None] * (n - len(vals))
 
-            # td가 없거나 부족하면 row_text 전체 숫자에서 추출
-            vals = td_vals
-            if len(vals) < len(years):
-                vals = numeric_values_from_text(row_text)
+                for idx, v in enumerate(vals):
+                    data[idx][key] = v
+                    if v is not None:
+                        value_count += 1
 
-            # 그래도 부족하면 다음 행 숫자까지 보조 확인
-            if len(vals) < len(years):
-                for sib in tr.find_next_siblings("tr", limit=3):
-                    sib_vals = numeric_values_from_cells(sib.select("td"))
-                    if len(sib_vals) >= len(years):
-                        vals = sib_vals
-                        break
+                matched += 1
+                found = True
+                debug_rows.append({
+                    "metric": metric_label,
+                    "key": key,
+                    "line_index": i,
+                    "value_line": value_line,
+                    "values": vals
+                })
+                break
 
-            vals = align_values(vals, len(years))
-            if len(vals) != len(years):
-                continue
-
-            matched_rows += 1
-            debug_rows.append({"row_index": ri, "label": matched_label, "raw": row_text[:120], "values": vals})
-
-            for i, v in enumerate(vals):
-                data[i][matched_key] = v
-                if v is not None:
-                    value_count += 1
-
-        if matched_rows == 0 or value_count == 0:
-            return None
-
-        annual_all = [data[i] for i in range(len(years))]
+        annual_all = data
         annual_estimates = [x for x in annual_all if x.get("is_estimate")]
 
-        # E 표시가 없는 경우 현재연도 이후를 추정치 후보로 분류
-        if not annual_estimates:
-            current_year = dt.date.today().year
-            annual_estimates = [x for x in annual_all if x.get("year", 0) >= current_year]
-            for x in annual_estimates:
-                x["is_estimate"] = True
-                x["estimate_reason"] = "E 표시는 없지만 현재연도 이후 컬럼이라 추정치 후보로 분류"
+        if matched == 0 or value_count == 0:
+            return None
 
         return {
             "status": "ok" if annual_estimates else "no_estimate_columns_found",
             "source": url,
-            "parser": "financial_highlight_row_cell",
-            "table_name": table_name,
-            "unit_note": "CompanyGuide Financial Highlight 표 기준. 매출/영업이익/순이익은 억원, EPS/BPS는 원, PER/PBR은 배, ROE는 %",
+            "parser": "financial_highlight_annual_block_v18",
+            "unit_note": "CompanyGuide Financial Highlight 표 기준. 매출/영업이익/순이익은 억원, EPS/BPS는 원, PER/PBR은 배, ROE/영업이익률은 %",
             "annual_all": annual_all,
             "annual_estimates": annual_estimates,
-            "matched_rows": matched_rows,
+            "matched_rows": matched,
             "value_count": value_count,
-            "debug_rows_sample": debug_rows[:5],
-            "note": "개인 스터디용 참고. Financial Highlight 연간표의 행/열 직접 매칭"
+            "selected_block_score": block_info["score"],
+            "selected_labels": labels,
+            "debug_rows_sample": debug_rows[:8],
+            "note": "개인 스터디용 참고. IFRS(연결) Annual 중 향후 추정치 포함 블록 강제 파싱"
         }
 
     try:
         r = requests.get(url, headers=headers, timeout=15)
         r.encoding = r.apparent_encoding or "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
-        full_text = soup.get_text(" ", strip=True)
+        lines = [clean_line(x) for x in soup.get_text("\n", strip=True).split("\n")]
+        lines = [x for x in lines if x]
+
+        block_info = find_best_annual_block(lines)
 
         debug = {
             "url": url,
             "html_len": len(r.text),
-            "table_count": len(soup.select("table")),
-            "has_highlight_D_A": bool(soup.select_one("#highlight_D_A")),
-            "contains_2027_est": "2027/12(E)" in full_text or "2027/12(E)" in r.text,
-            "year_labels_sample": year_labels_from_text(full_text)[:12]
+            "line_count": len(lines),
+            "financial_highlight_blocks": len([x for x in lines if norm(x) == "FinancialHighlight"]),
+            "best_block": block_info
         }
 
-        candidates = []
-
-        # 1순위: Financial Highlight 연간 영역 id
-        annual_div = soup.select_one("#highlight_D_A")
-        if annual_div:
-            for i, table in enumerate(annual_div.select("table")):
-                parsed = parse_table(table, f"highlight_D_A_table_{i}")
-                if parsed:
-                    candidates.append(parsed)
-
-        # 2순위: Financial Highlight 주변 전체에서 후보
-        if not candidates:
-            for i, table in enumerate(soup.select("table")):
-                t = norm(table.get_text(" ", strip=True))
-                if ("매출액" in t and "영업이익" in t and "PER" in t) or ("FinancialHighlight" in t and "매출액" in t):
-                    parsed = parse_table(table, f"all_table_{i}")
-                    if parsed:
-                        candidates.append(parsed)
-
-        if not candidates:
+        if not block_info:
             return {
                 "status": "확인 불가",
                 "annual_all": [],
                 "annual_estimates": [],
-                "note": "Financial Highlight 표는 확인했으나 행/열 숫자 매칭 실패",
+                "note": "Financial Highlight 블록을 찾지 못함",
                 "debug": debug
             }
 
-        candidates.sort(key=lambda x: (len(x.get("annual_estimates", [])), x.get("value_count", 0), x.get("matched_rows", 0)), reverse=True)
-        best = candidates[0]
-        best["debug_summary"] = debug
-        return best
+        parsed = parse_block(lines, block_info)
+        if parsed:
+            parsed["debug_summary"] = {
+                "url": url,
+                "line_count": len(lines),
+                "selected_block_score": block_info["score"],
+                "selected_labels": block_info["labels"],
+                "selected_preview": block_info["preview"]
+            }
+            return parsed
+
+        return {
+            "status": "확인 불가",
+            "annual_all": [],
+            "annual_estimates": [],
+            "note": "IFRS(연결) Annual 추정치 블록은 선택했으나 행명 다음 숫자줄 매칭 실패",
+            "debug": debug
+        }
 
     except Exception as e:
         return {
