@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="1.8.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="1.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v1.8-fnguide-annual-block"
+        "version": "v1.9-fnguide-encoding-lines"
     }
 
 
@@ -289,11 +289,11 @@ def parse_table_number(text: str):
 
 def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     """
-    CompanyGuide Financial Highlight 연간 블록 강제 파싱 v1.8.
-    핵심:
-    - Financial Highlight가 여러 번 나오므로, IFRS(연결) + Annual + 2027/12(E)가 있는 블록을 우선 선택
-    - 줄 단위 텍스트에서 연도 헤더 8개를 먼저 잡고, 각 행명 다음 숫자줄을 직접 매칭
-    - 효성중공업처럼 2025/12(E), 2026/12(E), 2027/12(E)가 보이는 케이스 대응
+    CompanyGuide Financial Highlight 연간 블록 파싱 v1.9.
+    개선:
+    - FnGuide 한글 깨짐 방지: 응답 bytes를 utf-8 우선 강제 디코딩
+    - 값이 '한 줄에 여러 숫자'가 아니라 '다음 줄마다 숫자 1개'인 구조 대응
+    - Financial Highlight > IFRS(연결) > Annual > 20xx(E) 블록에서 행명 뒤 숫자들을 순서대로 수집
     """
     gicode = "A" + stock_code
     url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode={gicode}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701"
@@ -319,6 +319,7 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         ("PBR", "pbr"),
         ("부채비율", "debt_ratio")
     ]
+    metric_labels = [m[0] for m in metrics]
 
     def clean_line(s):
         return str(s or "").replace("\xa0", " ").strip()
@@ -326,17 +327,26 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     def norm(s):
         return re.sub(r"\s+", "", clean_line(s))
 
+    def parse_single_number(line):
+        txt = clean_line(line)
+        if txt in ["", "-", "N/A"]:
+            return None
+        if re.fullmatch(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", txt):
+            return parse_table_number(txt)
+        return None
+
     def extract_num_tokens(line):
-        # N/A도 자리 맞춤용으로 None 처리
         tokens = re.findall(r"N/A|\(?-?\d[\d,]*\.?\d*\)?", clean_line(line))
         return [parse_table_number(t) for t in tokens]
+
+    def is_year_label(line):
+        return bool(re.fullmatch(r"20\d{2}/\d{2}(?:\(E\))?", clean_line(line)))
 
     def extract_year_labels(lines):
         labels = []
         for ln in lines:
-            m = re.fullmatch(r"20\d{2}/\d{2}(?:\(E\))?", clean_line(ln))
-            if m:
-                lab = m.group(0)
+            if is_year_label(ln):
+                lab = clean_line(ln)
                 if lab not in labels:
                     labels.append(lab)
         return labels
@@ -344,45 +354,38 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
     def make_year_records(labels):
         out = []
         for lab in labels:
-            y = re.search(r"(20\d{2})", lab)
-            if y:
+            m = re.search(r"(20\d{2})", lab)
+            if m:
                 out.append({
-                    "year": int(y.group(1)),
+                    "year": int(m.group(1)),
                     "label": lab,
                     "is_estimate": "E" in lab
                 })
         return out
 
     def find_best_annual_block(lines):
-        # Financial Highlight 시작점들
         starts = [i for i, ln in enumerate(lines) if norm(ln) == "FinancialHighlight"]
         blocks = []
         for idx, s in enumerate(starts):
             e = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
             block = lines[s:e]
             txt = "\n".join(block)
+            labels = extract_year_labels(block)
+            estimate_count = sum(1 for x in labels if "E" in x)
 
             score = 0
             if "IFRS(연결)" in txt:
                 score += 100
             if re.search(r"^Annual$", txt, re.MULTILINE):
                 score += 100
-            if "2027/12(E)" in txt:
-                score += 300
-            if "2026/12(E)" in txt:
-                score += 200
-            if "2025/12(E)" in txt:
-                score += 100
+            for yy, pts in [("2028/12(E)", 400), ("2027/12(E)", 300), ("2026/12(E)", 200), ("2025/12(E)", 100)]:
+                if yy in txt:
+                    score += pts
             if "Net Quarter" in txt:
-                score -= 30
-
-            labels = extract_year_labels(block)
-            estimate_count = sum(1 for x in labels if "E" in x)
-            score += estimate_count * 50
-            score += len(labels)
-
-            if "매출액" in txt and "영업이익" in txt and "EPS" in txt:
+                score -= 50
+            if "매출액" in txt and "영업이익" in txt:
                 score += 100
+            score += estimate_count * 50 + len(labels)
 
             blocks.append({
                 "start": s,
@@ -390,40 +393,65 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
                 "score": score,
                 "labels": labels,
                 "estimate_count": estimate_count,
-                "preview": block[:20]
+                "preview": block[:25]
             })
 
         if not blocks:
             return None
-
         blocks.sort(key=lambda x: x["score"], reverse=True)
         return blocks[0]
+
+    def is_metric_line(line):
+        nl = norm(line)
+        for lab in metric_labels:
+            if nl == norm(lab):
+                return True
+        for lab in ["매출액", "당기순이익", "지배주주순이익", "영업이익률", "부채비율"]:
+            if norm(lab) in nl and len(nl) <= len(norm(lab)) + 8:
+                return True
+        return False
 
     def row_matches(line, metric_label):
         nl = norm(line)
         ml = norm(metric_label)
-
-        # EPS(원), BPS(원)는 같은 표에서 설명행과 실제 행이 반복되므로 정확 매칭 우선
         if metric_label in ["EPS(원)", "BPS(원)"]:
-            return nl == norm(metric_label)
-
+            return nl == ml
         if metric_label in ["PER", "PBR", "ROE"]:
             return nl == metric_label
-
         if metric_label == "영업이익":
-            return nl == "영업이익"  # 영업이익(발표기준) 제외
+            return nl == "영업이익"
+        return ml in nl and len(nl) <= len(ml) + 8
 
-        if metric_label == "부채비율":
-            return nl == "부채비율"
+    def collect_values_after(block, start_idx, n):
+        vals = []
+        used_lines = []
+        for j in range(start_idx + 1, min(start_idx + 80, len(block))):
+            ln = block[j]
 
-        return ml in nl and len(nl) <= len(ml) + 4
+            if vals and is_metric_line(ln):
+                break
+
+            if is_year_label(ln) or "(E)" in ln or "Estimate" in ln or "컨센서스" in ln or "추정치" in ln:
+                continue
+
+            single = parse_single_number(ln)
+            if single is not None:
+                vals.append(single)
+                used_lines.append(ln)
+            else:
+                many = extract_num_tokens(ln)
+                if len(many) >= 2:
+                    vals.extend(many)
+                    used_lines.append(ln)
+
+            if len(vals) >= n:
+                return vals[:n], used_lines[:n]
+
+        return vals[:n], used_lines
 
     def parse_block(lines, block_info):
         block = lines[block_info["start"]:block_info["end"]]
         labels = block_info["labels"]
-
-        # 너무 많은 라벨이 잡히면 2020~2027(E)처럼 추정 3개 포함된 마지막 8개 우선
-        # 효성중공업 기준: 2020/12~2027/12(E)
         if len(labels) > 8:
             labels = labels[-8:]
 
@@ -438,46 +466,23 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         debug_rows = []
 
         for metric_label, key in metrics:
-            found = False
             for i, ln in enumerate(block):
                 if not row_matches(ln, metric_label):
                     continue
-
-                # 행명 다음 최대 8줄 안에서 숫자 개수가 연도 수 이상인 줄을 찾음
-                vals = []
-                value_line = None
-                for j in range(i + 1, min(i + 9, len(block))):
-                    cand = extract_num_tokens(block[j])
-                    # 설명문에 있는 100 같은 숫자 방지: 연도 수의 절반 이상 또는 정확히 n개 이상
-                    if len(cand) >= max(3, min(n, 5)):
-                        vals = cand
-                        value_line = block[j]
-                        if len(cand) >= n:
-                            break
-
-                if not vals:
+                vals, used = collect_values_after(block, i, n)
+                if len(vals) < n:
                     continue
-
-                # 값이 더 많으면 오른쪽 n개가 아니라, 보통 해당 줄이 정확히 n개. 
-                # 혹시 섞이면 마지막 n개보다 '처음 n개'가 연도 순서에 맞는 경우가 많음.
-                if len(vals) >= n:
-                    vals = vals[:n]
-                else:
-                    vals = vals + [None] * (n - len(vals))
-
                 for idx, v in enumerate(vals):
                     data[idx][key] = v
                     if v is not None:
                         value_count += 1
-
                 matched += 1
-                found = True
                 debug_rows.append({
                     "metric": metric_label,
                     "key": key,
                     "line_index": i,
-                    "value_line": value_line,
-                    "values": vals
+                    "values": vals,
+                    "used_lines": used
                 })
                 break
 
@@ -490,7 +495,7 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         return {
             "status": "ok" if annual_estimates else "no_estimate_columns_found",
             "source": url,
-            "parser": "financial_highlight_annual_block_v18",
+            "parser": "financial_highlight_line_values_v19",
             "unit_note": "CompanyGuide Financial Highlight 표 기준. 매출/영업이익/순이익은 억원, EPS/BPS는 원, PER/PBR은 배, ROE/영업이익률은 %",
             "annual_all": annual_all,
             "annual_estimates": annual_estimates,
@@ -498,14 +503,18 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
             "value_count": value_count,
             "selected_block_score": block_info["score"],
             "selected_labels": labels,
-            "debug_rows_sample": debug_rows[:8],
-            "note": "개인 스터디용 참고. IFRS(연결) Annual 중 향후 추정치 포함 블록 강제 파싱"
+            "debug_rows_sample": debug_rows[:10],
+            "note": "개인 스터디용 참고. Financial Highlight 연간 블록에서 행명 다음 숫자줄을 순서대로 수집"
         }
 
     try:
         r = requests.get(url, headers=headers, timeout=15)
-        r.encoding = r.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(r.text, "html.parser")
+        try:
+            html = r.content.decode("utf-8", errors="replace")
+        except Exception:
+            html = r.text
+
+        soup = BeautifulSoup(html, "html.parser")
         lines = [clean_line(x) for x in soup.get_text("\n", strip=True).split("\n")]
         lines = [x for x in lines if x]
 
@@ -513,7 +522,7 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
 
         debug = {
             "url": url,
-            "html_len": len(r.text),
+            "html_len": len(html),
             "line_count": len(lines),
             "financial_highlight_blocks": len([x for x in lines if norm(x) == "FinancialHighlight"]),
             "best_block": block_info

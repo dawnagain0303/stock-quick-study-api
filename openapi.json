@@ -3,7 +3,7 @@
   "info": {
     "title": "Korean Stock Quick Study API",
     "description": "한국 주식 종목명을 받아 주가, DART 재무, CompanyGuide Financial Highlight 연간 컨센서스를 반환합니다.",
-    "version": "1.8.0"
+    "version": "1.9.0"
   },
   "servers": [
     {
