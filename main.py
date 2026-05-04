@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.2.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.2-order-backlog-columnfix"
+        "version": "v2.3-sales-breakdown"
     }
 
 
@@ -964,6 +964,205 @@ def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
         "note": "DART 최신 정기보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
     }
 
+
+def score_sales_breakdown_table(matrix: List[List[str]], context_text: str) -> int:
+    text = normalize_backlog_text(" ".join([" ".join(r) for r in matrix]) + " " + context_text)
+    score = 0
+    for k, pts in {
+        "매출현황": 70, "매출실적": 80, "매출액": 40, "매출비중": 90,
+        "비중": 35, "사업부문": 50, "제품": 30, "품목": 30,
+        "주요제품": 50, "주요제품등": 60, "제품및서비스": 50,
+        "영업수익": 35, "사업의내용": 15
+    }.items():
+        if k in text:
+            score += pts
+
+    if any(k in text for k in ["수주잔고", "수주상황", "수주총액", "기말수주잔고", "계약잔액"]):
+        score -= 150
+
+    num_count = sum(1 for row in matrix for cell in row if parse_money_like(cell) is not None)
+    score += min(num_count, 30)
+    if len(matrix) < 2:
+        score -= 50
+    return score
+
+
+def matrix_to_sales_breakdown(matrix: List[List[str]], unit: Optional[str]) -> Dict[str, Any]:
+    if not matrix:
+        return {"status": "확인 불가", "note": "빈 표"}
+
+    header = matrix[0]
+    if len(matrix) > 1 and len(matrix[1]) > len(header) and len(header) <= 2:
+        header = matrix[1]
+
+    norm_headers = [normalize_backlog_text(h) for h in header]
+    col_map = {}
+
+    for idx, h in enumerate(norm_headers):
+        if any(k in h for k in ["사업부문", "부문", "제품", "품목", "구분", "사업", "서비스", "매출유형", "제품명"]):
+            col_map.setdefault("category", idx)
+            continue
+        if any(k in h for k in ["매출액", "매출실적", "영업수익", "수익"]):
+            if any(k in h for k in ["당기", "2025", "최근"]):
+                col_map["revenue"] = idx
+            else:
+                col_map.setdefault("revenue", idx)
+            continue
+        if any(k in h for k in ["비중", "구성비", "점유율"]):
+            col_map.setdefault("share", idx)
+            continue
+        if any(k in h for k in ["기간", "연도", "당기", "전기"]):
+            col_map.setdefault("period", idx)
+            continue
+
+    items = []
+    start_row = 1
+    if len(matrix) > 1 and header == matrix[1]:
+        start_row = 2
+
+    for row in matrix[start_row:]:
+        if not row or len(row) < 2:
+            continue
+
+        item = {}
+        for key, idx in col_map.items():
+            if idx < len(row):
+                val = row[idx]
+                if key == "revenue":
+                    item["revenue"] = parse_money_like(val)
+                    item["revenue_raw"] = val
+                elif key == "share":
+                    item["share"] = parse_money_like(val)
+                    item["share_raw"] = val
+                else:
+                    item[key] = val
+
+        text_cols = []
+        for c in row[:3]:
+            if parse_money_like(c) is None and str(c).strip():
+                text_cols.append(str(c).strip())
+        if text_cols:
+            item.setdefault("description", " / ".join(text_cols))
+
+        if item.get("revenue") is None:
+            nums = [parse_money_like(x) for x in row]
+            nums_clean = [x for x in nums if isinstance(x, (int, float))]
+            if nums_clean:
+                item.setdefault("revenue", max(nums_clean))
+                for c in row:
+                    if parse_money_like(c) == item["revenue"]:
+                        item.setdefault("revenue_raw", c)
+                        break
+
+        if "share" not in item:
+            for c in row:
+                if "%" in str(c):
+                    item["share"] = parse_money_like(c)
+                    item["share_raw"] = c
+                    break
+
+        if item and (item.get("revenue") is not None or item.get("share") is not None or item.get("description")):
+            items.append(item)
+
+    valid_items = []
+    for it in items:
+        label = normalize_backlog_text(str(it.get("category", "")) + str(it.get("description", "")))
+        if "합계" in label or "총계" in label or label == "계":
+            continue
+        if isinstance(it.get("revenue"), (int, float)):
+            valid_items.append(it)
+
+    total_revenue = sum(it["revenue"] for it in valid_items) if valid_items else None
+    if total_revenue:
+        for it in valid_items:
+            if it.get("share") is None and it.get("revenue") is not None:
+                it["share_calculated"] = round(it["revenue"] / total_revenue * 100, 1)
+
+    items_sorted = sorted(items, key=lambda x: x.get("revenue") if isinstance(x.get("revenue"), (int, float)) else -1, reverse=True)
+
+    return {
+        "unit": unit,
+        "columns_detected": col_map,
+        "items": items_sorted[:30],
+        "total_revenue_detected": total_revenue,
+        "raw_table_preview": matrix[:12]
+    }
+
+
+def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
+    latest = dart_list_latest_regular_report(corp_code)
+    if latest.get("status") != "ok":
+        return {"status": "확인 불가", "note": "최신 정기보고서 조회 실패", "latest_report": latest}
+
+    doc = dart_download_document_xml(latest.get("rcept_no"))
+    if doc.get("status") != "ok":
+        return {
+            "status": "확인 불가",
+            "note": "최신 정기보고서 원문 다운로드 실패",
+            "latest_report": latest,
+            "document_status": {k: v for k, v in doc.items() if k != "docs"}
+        }
+
+    candidates = []
+    keyword_hits = []
+    keywords = ["매출실적", "매출현황", "매출액", "매출비중", "주요제품", "제품및서비스", "사업부문"]
+
+    for d in doc.get("docs", []):
+        soup = d["soup"]
+        norm_doc = normalize_backlog_text(soup.get_text(" ", strip=True))
+        for kw in keywords:
+            if normalize_backlog_text(kw) in norm_doc:
+                keyword_hits.append({"filename": d["filename"], "keyword": kw})
+
+        for ti, table in enumerate(soup.select("table")):
+            matrix = table_to_matrix(table)
+            if not matrix:
+                continue
+            context = extract_context_around_table(table)
+            score = score_sales_breakdown_table(matrix, context)
+            if score <= 60:
+                continue
+            unit = detect_unit_near_text(context + " " + table.get_text(" ", strip=True))
+            summary = matrix_to_sales_breakdown(matrix, unit)
+            if not summary.get("items"):
+                continue
+            candidates.append({
+                "filename": d["filename"],
+                "table_index": ti,
+                "score": score,
+                "context_preview": context[-500:],
+                "summary": summary
+            })
+
+    if not candidates:
+        return {
+            "status": "확인 불가",
+            "note": "정기보고서 원문에서 사업부문/제품별 매출 구성표를 찾지 못함",
+            "latest_report": latest,
+            "keyword_hits": keyword_hits[:20]
+        }
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best = candidates[0]
+    return {
+        "status": "ok",
+        "source": "DART document.xml",
+        "latest_report": latest,
+        "matched_table": {
+            "filename": best["filename"],
+            "table_index": best["table_index"],
+            "score": best["score"],
+            "context_preview": best["context_preview"]
+        },
+        "unit": best["summary"].get("unit"),
+        "items": best["summary"].get("items"),
+        "columns_detected": best["summary"].get("columns_detected"),
+        "total_revenue_detected": best["summary"].get("total_revenue_detected"),
+        "raw_table_preview": best["summary"].get("raw_table_preview"),
+        "other_candidate_count": len(candidates) - 1,
+        "note": "DART 최신 정기보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+    }
+
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
     try:
         q = requests.utils.quote(name)
@@ -1005,6 +1204,7 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
         "historical_financials": historical_financials(corp_code),
         "latest_regular_report": latest_regular_report(corp_code),
         "order_backlog": fetch_order_backlog(corp_code),
+        "sales_breakdown": fetch_sales_breakdown(corp_code),
         "consensus": fetch_fnguide_consensus(stock_code),
         "recent_news": naver_news(resolved["name"]),
         "dcinside_community": dcinside_links(resolved["name"]),

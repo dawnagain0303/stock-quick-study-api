@@ -1,9 +1,10 @@
-# stock-quick-study-api v2.2 order backlog columnfix
+# stock-quick-study-api v2.3 sales breakdown
 
 수정 사항:
-- 수주잔고 표에서 '당기말 수주잔(YYYY.MM.DD)' 컬럼을 backlog로 정확히 인식
-- 기존에는 '당기/기말' 키워드 때문에 period로 잘못 잡히던 문제 수정
-- order_backlog.backlog_best_candidate 및 items[].backlog 반환 개선
+- 기존 주가/DART 재무/FnGuide 컨센서스/수주잔고 유지
+- DART 최신 정기보고서 원문에서 사업부문/제품별 매출액/매출비중 표 탐색
+- sales_breakdown 필드 추가
+- 회사별 표 구조가 다르므로 결과는 검증 필요
 
 환경변수:
 - DART_API_KEY
