@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.0.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.0-order-backlog"
+        "version": "v2.1-order-backlog-zipfix"
     }
 
 
@@ -626,7 +626,7 @@ def dart_download_document_xml(rcept_no: str) -> Dict[str, Any]:
         r = requests.get(url, params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no}, timeout=25)
 
         # 에러는 XML 텍스트로 오는 경우가 있음
-        if r.content[:5] != b"PK\x03\x04":
+        if not r.content.startswith(b"PK\x03\x04"):
             try:
                 msg = r.content.decode("utf-8", errors="replace")[:500]
             except Exception:
