@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.3.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.3-sales-breakdown"
+        "version": "v2.5-sales-breakdown-history"
     }
 
 
@@ -878,24 +878,70 @@ def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> D
         "raw_table_preview": matrix[:12]
     }
 
-def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
-    """
-    최신 정기보고서 원문에서 수주잔고/수주상황/계약잔액/미이행 수행의무 표를 탐색.
-    """
-    latest = dart_list_latest_regular_report(corp_code)
-    if latest.get("status") != "ok":
-        return {
-            "status": "확인 불가",
-            "note": "최신 정기보고서 조회 실패",
-            "latest_report": latest
-        }
 
-    doc = dart_download_document_xml(latest.get("rcept_no"))
+def dart_list_recent_annual_reports(corp_code: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    최근 사업보고서 5개를 찾는다. 기재정정 포함, 같은 사업연도 중복은 접수일 최신 우선.
+    """
+    if not DART_API_KEY or not corp_code:
+        return []
+    try:
+        today = dt.date.today()
+        bgn_de = (today - dt.timedelta(days=365 * 8)).strftime("%Y%m%d")
+        end_de = today.strftime("%Y%m%d")
+        url = "https://opendart.fss.or.kr/api/list.json"
+        params = {
+            "crtfc_key": DART_API_KEY,
+            "corp_code": corp_code,
+            "bgn_de": bgn_de,
+            "end_de": end_de,
+            "page_no": 1,
+            "page_count": 100
+        }
+        js = requests.get(url, params=params, timeout=15).json()
+        if js.get("status") != "000":
+            return []
+
+        candidates = []
+        for it in js.get("list", []):
+            rn = it.get("report_nm", "")
+            if "사업보고서" not in rn:
+                continue
+            m = re.search(r"\((20\d{2})\.", rn)
+            year = int(m.group(1)) if m else None
+            candidates.append({
+                "rcept_no": it.get("rcept_no"),
+                "report_nm": rn,
+                "rcept_dt": it.get("rcept_dt"),
+                "corp_name": it.get("corp_name"),
+                "business_year": year,
+                "status": "ok"
+            })
+
+        by_year = {}
+        for it in sorted(candidates, key=lambda x: x.get("rcept_dt", ""), reverse=True):
+            y = it.get("business_year") or it.get("rcept_dt", "")[:4]
+            if y not in by_year:
+                by_year[y] = it
+
+        reports = list(by_year.values())
+        reports.sort(key=lambda x: (x.get("business_year") or 0, x.get("rcept_dt", "")), reverse=True)
+        return reports[:limit]
+    except Exception:
+        return []
+
+
+def extract_order_backlog_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    특정 사업보고서 1개에서 수주잔고 표를 추출한다.
+    """
+    doc = dart_download_document_xml(report.get("rcept_no"))
     if doc.get("status") != "ok":
         return {
             "status": "확인 불가",
-            "note": "최신 정기보고서 원문 다운로드 실패",
-            "latest_report": latest,
+            "business_year": report.get("business_year"),
+            "latest_report": report,
+            "note": "보고서 원문 다운로드 실패",
             "document_status": {k: v for k, v in doc.items() if k != "docs"}
         }
 
@@ -909,8 +955,8 @@ def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
 
     for d in doc.get("docs", []):
         soup = d["soup"]
-        text = soup.get_text(" ", strip=True)
-        norm_text = normalize_backlog_text(text)
+        text_doc = soup.get_text(" ", strip=True)
+        norm_text = normalize_backlog_text(text_doc)
         for kw in keywords:
             if normalize_backlog_text(kw) in norm_text:
                 full_text_hits.append({"filename": d["filename"], "keyword": kw})
@@ -936,18 +982,19 @@ def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
     if not candidates:
         return {
             "status": "확인 불가",
-            "note": "정기보고서 원문에서 수주잔고 관련 표를 찾지 못함. 수주산업이 아니거나 표기가 다른 경우일 수 있음.",
-            "latest_report": latest,
+            "business_year": report.get("business_year"),
+            "latest_report": report,
+            "note": "정기보고서 원문에서 수주잔고 관련 표를 찾지 못함",
             "keyword_hits": full_text_hits[:20]
         }
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     best = candidates[0]
-
     return {
         "status": "ok",
+        "business_year": report.get("business_year"),
         "source": "DART document.xml",
-        "latest_report": latest,
+        "latest_report": report,
         "matched_table": {
             "filename": best["filename"],
             "table_index": best["table_index"],
@@ -961,9 +1008,82 @@ def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
         "columns_detected": best["summary"].get("columns_detected"),
         "raw_table_preview": best["summary"].get("raw_table_preview"),
         "other_candidate_count": len(candidates) - 1,
-        "note": "DART 최신 정기보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+        "note": "DART 사업보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
     }
 
+
+def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
+    """
+    최신 사업보고서 수주잔고 + 최근 5개년 사업보고서 수주잔고 이력 탐색.
+    """
+    reports = dart_list_recent_annual_reports(corp_code, limit=5)
+
+    if not reports:
+        latest = dart_list_latest_regular_report(corp_code)
+        if latest.get("status") != "ok":
+            return {
+                "status": "확인 불가",
+                "note": "최신 정기보고서 조회 실패",
+                "latest_report": latest,
+                "history": []
+            }
+        reports = [latest]
+
+    history = []
+    for rep in reports:
+        try:
+            parsed = extract_order_backlog_from_report(rep)
+            history.append(parsed)
+        except Exception as e:
+            history.append({
+                "status": "확인 불가",
+                "business_year": rep.get("business_year"),
+                "latest_report": rep,
+                "note": "수주잔고 파싱 중 오류",
+                "error": str(e)
+            })
+
+    ok_items = [x for x in history if x.get("status") == "ok"]
+
+    if not ok_items:
+        return {
+            "status": "확인 불가",
+            "note": "최근 사업보고서에서 수주잔고 표 자동 추출 실패",
+            "history": history,
+            "latest_report": reports[0] if reports else None
+        }
+
+    latest_ok = ok_items[0]
+
+    trend = []
+    for x in history:
+        trend.append({
+            "business_year": x.get("business_year"),
+            "report_nm": (x.get("latest_report") or {}).get("report_nm"),
+            "rcept_dt": (x.get("latest_report") or {}).get("rcept_dt"),
+            "status": x.get("status"),
+            "unit": x.get("unit"),
+            "backlog_best_candidate": x.get("backlog_best_candidate"),
+            "backlog_best_row": x.get("backlog_best_row")
+        })
+
+    return {
+        "status": "ok",
+        "source": "DART document.xml",
+        "latest_report": latest_ok.get("latest_report"),
+        "matched_table": latest_ok.get("matched_table"),
+        "unit": latest_ok.get("unit"),
+        "backlog_best_candidate": latest_ok.get("backlog_best_candidate"),
+        "backlog_best_row": latest_ok.get("backlog_best_row"),
+        "items": latest_ok.get("items"),
+        "columns_detected": latest_ok.get("columns_detected"),
+        "raw_table_preview": latest_ok.get("raw_table_preview"),
+        "history": history,
+        "trend": trend,
+        "history_years_requested": len(reports),
+        "history_success_count": len(ok_items),
+        "note": "DART 최근 사업보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+    }
 
 def score_sales_breakdown_table(matrix: List[List[str]], context_text: str) -> int:
     text = normalize_backlog_text(" ".join([" ".join(r) for r in matrix]) + " " + context_text)
@@ -1089,17 +1209,18 @@ def matrix_to_sales_breakdown(matrix: List[List[str]], unit: Optional[str]) -> D
     }
 
 
-def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
-    latest = dart_list_latest_regular_report(corp_code)
-    if latest.get("status") != "ok":
-        return {"status": "확인 불가", "note": "최신 정기보고서 조회 실패", "latest_report": latest}
 
-    doc = dart_download_document_xml(latest.get("rcept_no"))
+def extract_sales_breakdown_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    특정 사업보고서 1개에서 사업부문/제품별 매출액/비중 표를 추출한다.
+    """
+    doc = dart_download_document_xml(report.get("rcept_no"))
     if doc.get("status") != "ok":
         return {
             "status": "확인 불가",
-            "note": "최신 정기보고서 원문 다운로드 실패",
-            "latest_report": latest,
+            "business_year": report.get("business_year"),
+            "latest_report": report,
+            "note": "보고서 원문 다운로드 실패",
             "document_status": {k: v for k, v in doc.items() if k != "docs"}
         }
 
@@ -1137,8 +1258,9 @@ def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
     if not candidates:
         return {
             "status": "확인 불가",
-            "note": "정기보고서 원문에서 사업부문/제품별 매출 구성표를 찾지 못함",
-            "latest_report": latest,
+            "business_year": report.get("business_year"),
+            "latest_report": report,
+            "note": "사업보고서 원문에서 사업부문/제품별 매출 구성표를 찾지 못함",
             "keyword_hits": keyword_hits[:20]
         }
 
@@ -1146,8 +1268,9 @@ def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
     best = candidates[0]
     return {
         "status": "ok",
+        "business_year": report.get("business_year"),
         "source": "DART document.xml",
-        "latest_report": latest,
+        "latest_report": report,
         "matched_table": {
             "filename": best["filename"],
             "table_index": best["table_index"],
@@ -1160,7 +1283,102 @@ def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
         "total_revenue_detected": best["summary"].get("total_revenue_detected"),
         "raw_table_preview": best["summary"].get("raw_table_preview"),
         "other_candidate_count": len(candidates) - 1,
-        "note": "DART 최신 정기보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+        "note": "DART 사업보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
+    }
+
+
+def build_sales_breakdown_trend(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    5개년 매출비중 이력을 간단히 볼 수 있도록 연도별 주요 사업부문 items를 축약한다.
+    """
+    trend = []
+    for x in history:
+        items = []
+        for it in x.get("items") or []:
+            label = normalize_backlog_text(str(it.get("category", "")) + str(it.get("description", "")))
+            # 합계는 별도 total로 보고 주요 사업부문에서는 제외
+            if "합계" in label or "총계" in label or label == "계":
+                continue
+            items.append({
+                "category": it.get("category"),
+                "description": it.get("description"),
+                "revenue": it.get("revenue"),
+                "revenue_raw": it.get("revenue_raw"),
+                "share": it.get("share"),
+                "share_raw": it.get("share_raw"),
+                "share_calculated": it.get("share_calculated")
+            })
+        trend.append({
+            "business_year": x.get("business_year"),
+            "report_nm": (x.get("latest_report") or {}).get("report_nm"),
+            "rcept_dt": (x.get("latest_report") or {}).get("rcept_dt"),
+            "status": x.get("status"),
+            "unit": x.get("unit"),
+            "items": items[:15],
+            "total_revenue_detected": x.get("total_revenue_detected")
+        })
+    return trend
+
+
+def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
+    """
+    최신 사업보고서 매출구성 + 최근 5개년 사업보고서 매출구성 이력 탐색.
+    """
+    reports = dart_list_recent_annual_reports(corp_code, limit=5)
+
+    if not reports:
+        latest = dart_list_latest_regular_report(corp_code)
+        if latest.get("status") != "ok":
+            return {
+                "status": "확인 불가",
+                "note": "최신 정기보고서 조회 실패",
+                "latest_report": latest,
+                "history": []
+            }
+        reports = [latest]
+
+    history = []
+    for rep in reports:
+        try:
+            parsed = extract_sales_breakdown_from_report(rep)
+            history.append(parsed)
+        except Exception as e:
+            history.append({
+                "status": "확인 불가",
+                "business_year": rep.get("business_year"),
+                "latest_report": rep,
+                "note": "매출구성 파싱 중 오류",
+                "error": str(e)
+            })
+
+    ok_items = [x for x in history if x.get("status") == "ok"]
+
+    if not ok_items:
+        return {
+            "status": "확인 불가",
+            "note": "최근 사업보고서에서 사업부문/제품별 매출 구성표 자동 추출 실패",
+            "history": history,
+            "latest_report": reports[0] if reports else None
+        }
+
+    latest_ok = ok_items[0]
+    trend = build_sales_breakdown_trend(history)
+
+    return {
+        "status": "ok",
+        "source": "DART document.xml",
+        "latest_report": latest_ok.get("latest_report"),
+        "matched_table": latest_ok.get("matched_table"),
+        "unit": latest_ok.get("unit"),
+        "items": latest_ok.get("items"),
+        "columns_detected": latest_ok.get("columns_detected"),
+        "total_revenue_detected": latest_ok.get("total_revenue_detected"),
+        "raw_table_preview": latest_ok.get("raw_table_preview"),
+        "history": history,
+        "trend": trend,
+        "history_years_requested": len(reports),
+        "history_success_count": len(ok_items),
+        "note": "DART 최근 사업보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
     }
 
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
