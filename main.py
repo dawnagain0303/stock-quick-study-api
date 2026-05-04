@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.1.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +45,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.1-order-backlog-zipfix"
+        "version": "v2.2-order-backlog-columnfix"
     }
 
 
@@ -774,7 +774,7 @@ def extract_context_around_table(table, chars: int = 500) -> str:
 def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> Dict[str, Any]:
     """
     다양한 수주잔고 표를 일반화해서 반환.
-    정확한 컬럼 매핑이 어려우므로 원본 matrix와 함께 핵심 컬럼 후보를 추출한다.
+    v2.2 개선: '당기말 수주잔(YYYY.MM.DD)' 같은 컬럼을 period가 아니라 backlog로 정확히 잡는다.
     """
     if not matrix:
         return {"status": "확인 불가", "note": "빈 표"}
@@ -788,19 +788,37 @@ def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> D
 
     norm_headers = [normalize_backlog_text(h) for h in header]
 
-    # 컬럼 후보
     col_map = {}
     for idx, h in enumerate(norm_headers):
-        if any(k in h for k in ["품목", "부문", "사업", "공사", "계약", "프로젝트", "구분"]):
-            col_map.setdefault("category", idx)
-        if any(k in h for k in ["수주총액", "계약금액", "수주액", "총계약"]):
+        # 1순위: 수주잔고/계약잔액/미이행/잔여 관련 컬럼은 무조건 backlog
+        if any(k in h for k in [
+            "당기말수주잔", "기말수주잔", "전기말수주잔", "수주잔고", "수주잔",
+            "계약잔액", "잔여계약", "잔여수주", "미이행", "수행의무잔액"
+        ]):
+            # 당기말/기말/잔여/미이행/계약잔액을 우선
+            if "backlog" not in col_map or any(k in h for k in ["당기말", "기말", "잔여", "미이행", "계약잔액"]):
+                col_map["backlog"] = idx
+            continue
+
+        # 2순위: 수주액/계약금액
+        if any(k in h for k in ["당기수주액", "수주총액", "수주액", "계약금액", "총계약"]):
             col_map.setdefault("order_amount", idx)
-        if any(k in h for k in ["기납품", "납품액", "매출액", "수익인식", "이행금액"]):
+            continue
+
+        # 3순위: 매출/납품/기납품
+        if any(k in h for k in ["당기매출액", "기납품", "납품액", "매출액", "수익인식", "이행금액"]):
             col_map.setdefault("delivered_amount", idx)
-        if any(k in h for k in ["수주잔고", "기말수주잔고", "잔고", "계약잔액", "미이행", "잔여"]):
-            col_map.setdefault("backlog", idx)
-        if any(k in h for k in ["기간", "연도", "당기", "전기", "기말"]):
+            continue
+
+        # 4순위: 분류 컬럼
+        if any(k in h for k in ["사업부문", "품목", "부문", "사업", "공사", "프로젝트", "구분", "회사", "지배회사"]):
+            col_map.setdefault("category", idx)
+            continue
+
+        # 5순위: 순수 기간 컬럼만 period. 단, 수주/잔고/잔액 들어가면 period로 보지 않음.
+        if any(k in h for k in ["기간", "연도"]) and not any(k in h for k in ["수주", "잔고", "잔액"]):
             col_map.setdefault("period", idx)
+            continue
 
     items = []
     start_row = 1
@@ -810,6 +828,7 @@ def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> D
     for row in matrix[start_row:]:
         if not row or len(row) < 2:
             continue
+
         item = {}
         for key, idx in col_map.items():
             if idx < len(row):
@@ -819,22 +838,34 @@ def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> D
                     item[key + "_raw"] = val
                 else:
                     item[key] = val
+
+        # 보기 좋게 사업부문/회사/품목 앞쪽 텍스트 컬럼을 묶은 설명 추가
+        text_cols = []
+        for c in row[:3]:
+            if parse_money_like(c) is None and str(c).strip():
+                text_cols.append(str(c).strip())
+        if text_cols:
+            item.setdefault("description", " / ".join(text_cols))
+
         # 컬럼 매핑 실패 시 행 전체 유지
         if not item:
             nums = [parse_money_like(x) for x in row]
             if any(x is not None for x in nums):
                 item = {"raw_row": row, "numbers": nums}
+
         if item:
             items.append(item)
 
-    # 핵심 backlog 총액 후보: backlog 컬럼 중 마지막/합계/계 행 우선
+    # 핵심 backlog 총액 후보: backlog 컬럼 중 마지막/합계/계 행 우선, 아니면 첫 유효값
     backlog_candidates = []
     for it in items:
         if it.get("backlog") is not None:
-            label = normalize_backlog_text(str(it.get("category", "")) + str(it.get("period", "")) + str(it))
+            label = normalize_backlog_text(str(it.get("category", "")) + str(it.get("period", "")) + str(it.get("description", "")) + str(it))
             priority = 0
-            if "합계" in label or "계" == label or "총계" in label:
-                priority += 10
+            if "합계" in label or "총계" in label:
+                priority += 20
+            if "중공업" in label:
+                priority += 5
             backlog_candidates.append((priority, it.get("backlog"), it))
     backlog_candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -846,7 +877,6 @@ def matrix_to_backlog_summary(matrix: List[List[str]], unit: Optional[str]) -> D
         "backlog_best_row": backlog_candidates[0][2] if backlog_candidates else None,
         "raw_table_preview": matrix[:12]
     }
-
 
 def fetch_order_backlog(corp_code: str) -> Dict[str, Any]:
     """
