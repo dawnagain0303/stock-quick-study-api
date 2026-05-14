@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Korean Stock Quick Study API",
-    "description": "한국 주식 종목명을 받아 주가, DART 재무, CompanyGuide 컨센서스, 최근 5년 수주잔고와 매출구성 데이터를 반환합니다.",
-    "version": "2.5.0"
+    "description": "한국 주식 종목 데이터를 반환하며, 커뮤니티 반응은 디시인사이드 검색만 사용합니다.",
+    "version": "2.8.0"
   },
   "servers": [
     {
@@ -89,6 +89,10 @@
                       "additionalProperties": true
                     },
                     "sales_breakdown": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "community_reaction": {
                       "type": "object",
                       "additionalProperties": true
                     }

@@ -12,8 +12,10 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.5.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="2.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +47,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.5-sales-breakdown-history"
+        "version": "v2.8-dcinside-only"
     }
 
 
@@ -225,6 +227,72 @@ def pick_first(row: Dict[str, Any], key: str, amount: Any):
         row[key] = amount
 
 
+def is_capital_stock_account(acc: str) -> bool:
+    a = str(acc or "").replace(" ", "")
+    return a in [
+        "자본금", "보통주자본금", "우선주자본금", "납입자본", "자본잉여금",
+        "기타자본", "기타자본항목", "기타포괄손익누계액", "이익잉여금",
+        "결손금", "비지배지분", "지배기업소유주지분"
+    ]
+
+
+def is_equity_total_account(acc: str) -> bool:
+    a = str(acc or "").replace(" ", "")
+    return a in [
+        "자본총계", "총자본", "자본계", "자본총액",
+        "자본과부채총계에서부채총계를차감한금액"
+    ]
+
+
+def validate_equity_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    assets = row.get("assets")
+    liabilities = row.get("liabilities")
+    equity = row.get("equity")
+
+    row.setdefault("equity_source", row.get("equity_source") or None)
+    row.setdefault("equity_warning", None)
+
+    calculated = None
+    if isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)):
+        calculated = assets - liabilities
+        row["equity_calculated_assets_minus_liabilities"] = calculated
+
+    if calculated is None:
+        return row
+
+    if equity is None:
+        row["equity"] = calculated
+        row["equity_source"] = "assets_minus_liabilities"
+        row["equity_warning"] = "DART 자본총계 직접 매핑 실패. 자산-부채로 보조 계산"
+        return row
+
+    diff = abs(equity - calculated)
+    tolerance = max(abs(calculated) * 0.03, 1000000)
+    suspicious_small = bool(calculated and calculated > 0 and equity > 0 and equity < calculated * 0.5)
+
+    if diff > tolerance or suspicious_small:
+        row["equity_original_api"] = equity
+        row["equity"] = calculated
+        row["equity_source"] = "assets_minus_liabilities"
+        row["equity_warning"] = "API 자본 항목 오인식 가능성. 자산-부채로 보조 계산한 자본총계를 사용"
+    else:
+        row["equity_source"] = row.get("equity_source") or "dart_equity_total"
+
+    return row
+
+
+def recompute_debt_ratio(row: Dict[str, Any]) -> Dict[str, Any]:
+    liabilities = row.get("liabilities")
+    equity = row.get("equity")
+    if isinstance(liabilities, (int, float)) and isinstance(equity, (int, float)) and equity != 0:
+        row["debt_ratio"] = round(liabilities / equity * 100, 1)
+        if row.get("equity_source") == "assets_minus_liabilities":
+            row["debt_ratio_source"] = "liabilities_div_assets_minus_liabilities"
+        else:
+            row["debt_ratio_source"] = "liabilities_div_equity"
+    return row
+
+
 def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
     if not corp_code:
         return []
@@ -248,10 +316,16 @@ def historical_financials(corp_code: str) -> List[Dict[str, Any]]:
                 row["assets"] = amt
             elif acc == "부채총계":
                 row["liabilities"] = amt
-            elif acc == "자본총계":
+            elif is_equity_total_account(acc):
                 row["equity"] = amt
+                row["equity_source"] = "dart_equity_total"
+            elif is_capital_stock_account(acc):
+                if acc in ["자본금", "보통주자본금", "우선주자본금"]:
+                    row["capital_stock"] = amt
         if row["revenue"] and row["operating_income"] is not None:
             row["operating_margin"] = round(row["operating_income"] / row["revenue"] * 100, 1)
+        row = validate_equity_row(row)
+        row = recompute_debt_ratio(row)
         out.append(row)
     return out
 
@@ -275,10 +349,14 @@ def latest_regular_report(corp_code: str) -> Dict[str, Any]:
                 pick_first(row, "cash_and_cash_equivalents", amt)
             elif acc == "부채총계":
                 row["liabilities"] = amt
-            elif acc == "자본총계":
+            elif is_equity_total_account(acc):
                 row["equity"] = amt
-        if row["liabilities"] is not None and row["equity"]:
-            row["debt_ratio"] = round(row["liabilities"] / row["equity"] * 100, 1)
+                row["equity_source"] = "dart_equity_total"
+            elif is_capital_stock_account(acc):
+                if acc in ["자본금", "보통주자본금", "우선주자본금"]:
+                    row["capital_stock"] = amt
+        row = validate_equity_row(row)
+        row = recompute_debt_ratio(row)
         return row
     return {"note": "최신 정기보고서 재무 데이터 확인 불가"}
 
@@ -1381,7 +1459,412 @@ def fetch_sales_breakdown(corp_code: str) -> Dict[str, Any]:
         "note": "DART 최근 사업보고서 본문 표 자동 파싱 결과. 회사별 표 구조가 달라 검증 필요."
     }
 
+def strip_html_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", str(s or "")).replace("&quot;", '"').replace("&amp;", "&").strip()
+
+
+def classify_news_topic(text_value: str) -> Dict[str, Any]:
+    text_norm = str(text_value or "")
+    topic_keywords = {
+        "실적": ["실적", "매출", "영업이익", "순이익", "어닝", "흑자", "적자"],
+        "수주/공급": ["수주", "공급", "계약", "납품", "파트너", "공급계약"],
+        "제품/기술": ["제품", "기술", "출시", "개발", "파이프라인", "ESL", "전자가격표시기", "AI", "전력기기", "변압기"],
+        "증권사 리포트": ["목표가", "투자의견", "리포트", "증권", "컨센서스"],
+        "주가": ["급등", "강세", "하락", "상승", "약세", "신고가", "상한가"],
+        "투자/증설": ["증설", "투자", "CAPEX", "공장", "설비"]
+    }
+    scores = {}
+    for topic, kws in topic_keywords.items():
+        scores[topic] = sum(1 for kw in kws if kw.lower() in text_norm.lower())
+    best_topic = max(scores, key=scores.get) if scores else "기타"
+    if scores.get(best_topic, 0) == 0:
+        best_topic = "기타"
+
+    positive_words = ["상승", "강세", "흑자", "수주", "성장", "개선", "호조", "확대", "최대", "신고가", "목표가 상향"]
+    negative_words = ["하락", "약세", "적자", "부진", "감소", "우려", "하향", "쇼크", "손실"]
+
+    pos = sum(1 for w in positive_words if w in text_norm)
+    neg = sum(1 for w in negative_words if w in text_norm)
+
+    if pos > neg and pos > 0:
+        tone = "positive_candidate"
+    elif neg > pos and neg > 0:
+        tone = "negative_candidate"
+    elif pos == neg == 0:
+        tone = "neutral"
+    else:
+        tone = "unclear"
+
+    return {"topic": best_topic, "tone": tone, "topic_score": scores.get(best_topic, 0), "positive_hits": pos, "negative_hits": neg}
+
+
+def score_news_item(item: Dict[str, Any], corp_name: str, stock_code: str, aliases: List[str]) -> int:
+    text_value = f"{item.get('title','')} {item.get('summary','')} {item.get('description','')}"
+    score = 0
+    if corp_name and corp_name in text_value:
+        score += 50
+    if stock_code and stock_code in text_value:
+        score += 30
+    for alias in aliases:
+        if alias and alias in text_value:
+            score += 15
+    important_keywords = [
+        "실적", "영업이익", "매출", "수주", "공급", "계약", "납품",
+        "ESL", "전자가격표시기", "전력기기", "변압기", "전자부품",
+        "증설", "투자", "컨센서스", "목표가", "리포트", "신고가"
+    ]
+    score += sum(5 for kw in important_keywords if kw in text_value)
+    return score
+
+
+def parse_pubdate_to_ymd(pubdate: str) -> Optional[str]:
+    try:
+        # Tue, 07 May 2026 10:30:00 +0900
+        from email.utils import parsedate_to_datetime
+        d = parsedate_to_datetime(pubdate)
+        return d.date().isoformat()
+    except Exception:
+        return None
+
+
+def fetch_naver_openapi_news(corp_name: str, stock_code: str, aliases: List[str], max_items: int = 10) -> Dict[str, Any]:
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return {"status": "skipped", "note": "NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET 환경변수 없음", "items": []}
+
+    queries = [corp_name, f"{corp_name} {stock_code}"]
+    for a in aliases[:4]:
+        if a and a not in queries:
+            queries.append(f"{corp_name} {a}")
+
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+    }
+
+    collected = []
+    seen = set()
+    for q in queries:
+        try:
+            url = "https://openapi.naver.com/v1/search/news.json"
+            params = {"query": q, "display": 10, "sort": "date"}
+            js = requests.get(url, headers=headers, params=params, timeout=10).json()
+            for it in js.get("items", []):
+                title = strip_html_tags(it.get("title"))
+                desc = strip_html_tags(it.get("description"))
+                link = it.get("originallink") or it.get("link")
+                key = link or title
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                item = {
+                    "date": parse_pubdate_to_ymd(it.get("pubDate")) or it.get("pubDate"),
+                    "source": "Naver News API",
+                    "title": title,
+                    "url": link,
+                    "summary": desc,
+                    "query": q
+                }
+                meta = classify_news_topic(title + " " + desc)
+                item.update(meta)
+                item["relevance_score"] = score_news_item(item, corp_name, stock_code, aliases)
+                collected.append(item)
+        except Exception:
+            continue
+
+    filtered = [x for x in collected if x.get("relevance_score", 0) >= 30]
+    filtered.sort(key=lambda x: (x.get("relevance_score", 0), x.get("date") or ""), reverse=True)
+    return {
+        "status": "ok" if filtered else "확인 불가",
+        "source": "Naver News API",
+        "items": filtered[:max_items],
+        "collected_count": len(collected),
+        "note": "네이버 뉴스 검색 API 기준"
+    }
+
+
+def fetch_naver_finance_news(stock_code: str, corp_name: str, aliases: List[str], max_items: int = 10) -> Dict[str, Any]:
+    url = f"https://finance.naver.com/item/news_news.naver?code={stock_code}&page=1&sm=title_entity_id.basic&clusterId="
+    items = []
+    try:
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+        for tr in soup.select("tr"):
+            title_a = tr.select_one("td.title a")
+            if not title_a:
+                continue
+            title = title_a.get_text(" ", strip=True)
+            href = title_a.get("href") or ""
+            if href.startswith("/"):
+                link = "https://finance.naver.com" + href
+            else:
+                link = href
+            info = [td.get_text(" ", strip=True) for td in tr.select("td")]
+            source = info[1] if len(info) > 1 else "네이버증권"
+            date = info[2] if len(info) > 2 else None
+            item = {
+                "date": date,
+                "source": source,
+                "title": title,
+                "url": link,
+                "summary": "",
+                "query": "naver_finance_item_news"
+            }
+            meta = classify_news_topic(title)
+            item.update(meta)
+            item["relevance_score"] = score_news_item(item, corp_name, stock_code, aliases) + 20
+            items.append(item)
+    except Exception as e:
+        return {"status": "확인 불가", "source": "Naver Finance News", "items": [], "error": str(e)}
+
+    # 중복 제거
+    seen = set()
+    unique = []
+    for x in items:
+        key = x.get("url") or x.get("title")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(x)
+
+    return {
+        "status": "ok" if unique else "확인 불가",
+        "source": "Naver Finance News",
+        "items": unique[:max_items],
+        "note": "네이버증권 종목뉴스 기준"
+    }
+
+
+def build_recent_news(corp_name: str, stock_code: str, aliases: Optional[List[str]] = None) -> Dict[str, Any]:
+    aliases = aliases or []
+    api_news = fetch_naver_openapi_news(corp_name, stock_code, aliases, max_items=10)
+    finance_news = fetch_naver_finance_news(stock_code, corp_name, aliases, max_items=10)
+
+    all_items = []
+    for src in [api_news, finance_news]:
+        all_items.extend(src.get("items") or [])
+
+    seen = set()
+    unique = []
+    for x in all_items:
+        key = x.get("url") or x.get("title")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(x)
+
+    unique.sort(key=lambda x: (x.get("relevance_score", 0), x.get("date") or ""), reverse=True)
+
+    return {
+        "status": "ok" if unique else "확인 불가",
+        "as_of": dt.date.today().isoformat(),
+        "lookback_days": 30,
+        "items": unique[:10],
+        "source_status": {
+            "naver_openapi": api_news.get("status"),
+            "naver_finance": finance_news.get("status")
+        },
+        "note": "뉴스는 관련성 점수와 날짜를 함께 고려한 참고용 결과"
+    }
+
+
+def sentiment_from_text(text_value: str) -> str:
+    positive_words = ["호재", "상승", "강세", "수주", "성장", "실적", "흑자", "기대", "신고가", "매수"]
+    negative_words = ["악재", "하락", "약세", "고점", "과열", "부담", "적자", "우려", "손절", "매도"]
+    pos = sum(1 for w in positive_words if w in text_value)
+    neg = sum(1 for w in negative_words if w in text_value)
+    if pos > neg and pos > 0:
+        return "positive"
+    if neg > pos and neg > 0:
+        return "negative"
+    return "neutral"
+
+
+def fetch_naver_discussion(stock_code: str, corp_name: str, max_items: int = 20) -> List[Dict[str, Any]]:
+    # 네이버 종목토론실 최신글
+    url = f"https://finance.naver.com/item/board.naver?code={stock_code}&page=1"
+    posts = []
+    try:
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+        for tr in soup.select("tr"):
+            title_a = tr.select_one("td.title a")
+            if not title_a:
+                continue
+            title = title_a.get_text(" ", strip=True)
+            href = title_a.get("href") or ""
+            link = "https://finance.naver.com" + href if href.startswith("/") else href
+            tds = [td.get_text(" ", strip=True) for td in tr.select("td")]
+            date = tds[0] if tds else None
+            posts.append({
+                "source": "naver_discussion",
+                "date": date,
+                "title": title,
+                "url": link,
+                "sentiment": sentiment_from_text(title),
+                "keywords": extract_reaction_keywords(title)
+            })
+            if len(posts) >= max_items:
+                break
+    except Exception:
+        pass
+    return posts
+
+
+def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items: int = 30) -> List[Dict[str, Any]]:
+    """
+    디시인사이드 검색 전용 수집.
+    100% 보장은 불가능하지만, 여러 URL 패턴/파서를 순차 시도해 성공률을 높인다.
+    """
+    queries = []
+    for q in [corp_name, stock_code, f"{corp_name} 주식", f"{corp_name} 실적"]:
+        if q and q not in queries:
+            queries.append(q)
+
+    headers = {
+        **HEADERS,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Referer": "https://www.dcinside.com/",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    posts = []
+    seen = set()
+
+    def add_post(title, href, source_url):
+        title = strip_html_tags(title).strip()
+        href = str(href or "").strip()
+        if not title:
+            return
+        # 종목명 또는 종목코드가 제목/URL 주변에 있으면 우선 채택.
+        # 너무 엄격하면 누락되므로 corp_name 없는 결과도 일부 허용하되 검색 URL 기반으로만 수집.
+        if corp_name not in title and stock_code and stock_code not in title:
+            # 주식/실적/수주 같은 맥락어가 있으면 허용
+            if not any(k in title for k in ["주식", "실적", "수주", "급등", "하락", "상승", "고점", "저점", "매수", "매도"]):
+                return
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = "https://gall.dcinside.com" + href
+        if not href:
+            href = source_url
+        key = href + "|" + title
+        if key in seen:
+            return
+        seen.add(key)
+        posts.append({
+            "source": "dcinside",
+            "date": None,
+            "title": title[:160],
+            "url": href,
+            "sentiment": sentiment_from_text(title),
+            "keywords": extract_reaction_keywords(title)
+        })
+
+    for q in queries:
+        encoded = requests.utils.quote(q)
+        urls = [
+            f"https://search.dcinside.com/post/q/{encoded}/sort/latest",
+            f"https://search.dcinside.com/combine/q/{encoded}",
+            f"https://search.dcinside.com/post/p/1/q/{encoded}/sort/latest",
+        ]
+
+        for url in urls:
+            if len(posts) >= max_items:
+                break
+            try:
+                html = requests.get(url, headers=headers, timeout=12).text
+                soup = BeautifulSoup(html, "html.parser")
+
+                # 1) 검색결과 리스트에서 제목 링크 추출
+                selectors = [
+                    "a.tit_txt",
+                    "a.sch_result_title",
+                    ".sch_result_list a",
+                    ".result_list a",
+                    "li a",
+                    "a"
+                ]
+                for sel in selectors:
+                    for a in soup.select(sel):
+                        if len(posts) >= max_items:
+                            break
+                        title = a.get_text(" ", strip=True)
+                        href = a.get("href") or ""
+                        if not title or len(title) < 2:
+                            continue
+                        if "dcinside" not in href and not href.startswith("/"):
+                            continue
+                        add_post(title, href, url)
+                    if posts:
+                        break
+
+                # 2) 정규식 fallback
+                if not posts:
+                    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.I | re.S):
+                        href = m.group(1)
+                        raw_title = re.sub(r"<[^>]+>", " ", m.group(2))
+                        title = re.sub(r"\s+", " ", raw_title).strip()
+                        if "dcinside" in href or href.startswith("/"):
+                            add_post(title, href, url)
+                            if len(posts) >= max_items:
+                                break
+            except Exception:
+                continue
+
+    return posts[:max_items]
+
+def build_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
+    """
+    커뮤니티는 디시인사이드만 사용.
+    네이버 종목토론실은 사용하지 않는다.
+    """
+    posts = fetch_dcinside_search_posts(corp_name, stock_code, max_items=30)
+
+    keyword_counts = {}
+    sentiment = {"positive": 0, "negative": 0, "neutral": 0}
+    for p in posts:
+        s = p.get("sentiment") or "neutral"
+        sentiment[s] = sentiment.get(s, 0) + 1
+        for k in p.get("keywords") or []:
+            keyword_counts[k] = keyword_counts.get(k, 0) + 1
+
+    top_keywords = sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)
+    top_keywords = [{"keyword": k, "count": v} for k, v in top_keywords[:10]]
+
+    if posts:
+        summary_parts = []
+        if top_keywords:
+            summary_parts.append("상위 키워드: " + ", ".join([x["keyword"] for x in top_keywords[:5]]))
+        if sentiment["positive"] > sentiment["negative"]:
+            summary_parts.append("긍정 언급이 상대적으로 많음")
+        elif sentiment["negative"] > sentiment["positive"]:
+            summary_parts.append("부정/부담 언급이 상대적으로 많음")
+        else:
+            summary_parts.append("긍정·부정 언급이 혼재")
+        summary = "; ".join(summary_parts)
+        status = "ok"
+        note = "디시인사이드 검색 결과 기준"
+    else:
+        summary = "디시인사이드 자동 수집 결과 없음"
+        status = "확인 불가"
+        note = "디시인사이드 검색 페이지 차단, 구조 변경, 결과 없음 중 하나일 수 있음"
+
+    return {
+        "status": status,
+        "as_of": dt.date.today().isoformat(),
+        "lookback_days": 14,
+        "sources": ["dcinside"],
+        "mention_count": len(posts),
+        "top_keywords": top_keywords,
+        "sentiment": sentiment,
+        "summary": summary,
+        "sample_posts": posts[:10],
+        "warning": "디시인사이드 글은 사실 검증되지 않은 투자자 의견",
+        "note": note
+    }
+
+
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
+    # 호환성 유지용. stock_report에서는 build_recent_news를 사용.
     try:
         q = requests.utils.quote(name)
         url = f"https://search.naver.com/search.naver?where=news&query={q}"
@@ -1415,7 +1898,8 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
             "historical_financials": "DART 사업보고서 기준",
             "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
             "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
-            "community": "디시인사이드 주식갤러리 검색 참고"
+            "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
+            "community": "디시인사이드 검색 참고. 네이버 종목토론실은 사용하지 않음"
         },
         "price": fetch_naver_price(stock_code),
         "weekly_price_summary": weekly_summary(stock_code),
@@ -1424,7 +1908,8 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
         "order_backlog": fetch_order_backlog(corp_code),
         "sales_breakdown": fetch_sales_breakdown(corp_code),
         "consensus": fetch_fnguide_consensus(stock_code),
-        "recent_news": naver_news(resolved["name"]),
+        "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
+        "community_reaction": build_community_reaction(resolved["name"], stock_code),
         "dcinside_community": dcinside_links(resolved["name"]),
         "report_prompt_for_gpt": "위 JSON을 바탕으로 1페이지 한국 주식 퀵 스터디 리포트를 작성하세요. 불확실한 항목은 확인 불가로 표시하고, 매수/매도 추천은 하지 마세요."
     }
