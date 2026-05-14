@@ -15,7 +15,7 @@ DART_API_KEY = os.getenv("DART_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="2.8.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,7 +47,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v2.8-dcinside-only"
+        "version": "v3.0-dcinside-neostock-30d"
     }
 
 
@@ -644,6 +644,77 @@ def fetch_fnguide_consensus(stock_code: str) -> Dict[str, Any]:
         }
 
 
+def sanitize_latest_regular_report(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    latest_regular_report에서 equity가 자본금으로 잘못 잡히는 경우를 마지막에 강제 검산.
+    """
+    if not isinstance(row, dict):
+        return row
+
+    assets = row.get("assets")
+    liabilities = row.get("liabilities")
+    equity = row.get("equity")
+    capital_stock = row.get("capital_stock")
+
+    if isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)):
+        calc = assets - liabilities
+        row["equity_calculated_assets_minus_liabilities"] = calc
+
+        bad = False
+        if equity is None:
+            bad = True
+        elif capital_stock is not None and equity == capital_stock:
+            bad = True
+        elif isinstance(equity, (int, float)):
+            tolerance = max(abs(calc) * 0.03, 1000000)
+            if abs(equity - calc) > tolerance:
+                bad = True
+            if calc > 0 and equity > 0 and equity < calc * 0.5:
+                bad = True
+
+        if bad:
+            row["equity_original_api"] = equity
+            row["equity"] = calc
+            row["equity_source"] = "assets_minus_liabilities"
+            row["equity_warning"] = "API 자본 항목 오인식 가능성. 자산-부채로 보조 계산한 자본총계를 사용"
+        else:
+            row["equity_source"] = row.get("equity_source") or "dart_equity_total"
+
+    if isinstance(row.get("liabilities"), (int, float)) and isinstance(row.get("equity"), (int, float)) and row.get("equity") != 0:
+        row["debt_ratio"] = round(row["liabilities"] / row["equity"] * 100, 1)
+        row["debt_ratio_source"] = "liabilities_div_assets_minus_liabilities" if row.get("equity_source") == "assets_minus_liabilities" else "liabilities_div_equity"
+
+    return row
+
+
+def sanitize_order_backlog_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    수주잔고 파서가 재무상태표 같은 무관 표를 잡는 경우 방지.
+    backlog_best_candidate가 없고 items에도 backlog가 없으면 확인 불가 처리.
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+
+    has_backlog = result.get("backlog_best_candidate") is not None
+    for it in result.get("items") or []:
+        if isinstance(it, dict) and it.get("backlog") is not None:
+            has_backlog = True
+            break
+    for tr in result.get("trend") or []:
+        if isinstance(tr, dict) and tr.get("backlog_best_candidate") is not None:
+            has_backlog = True
+            break
+
+    if not has_backlog:
+        result["status"] = "확인 불가"
+        result["note"] = "DART 본문에서 실제 수주잔고 금액 컬럼을 찾지 못함. 수주산업이 아니거나 자동 추출 대상 표가 아닐 수 있음."
+        result["backlog_best_candidate"] = None
+        result["backlog_best_row"] = None
+        result["items"] = []
+        result["trend"] = []
+    return result
+
+
 def dart_list_latest_regular_report(corp_code: str) -> Dict[str, Any]:
     """
     DART 공시목록에서 최신 정기보고서(사업/반기/분기)를 찾는다.
@@ -825,6 +896,14 @@ def score_order_backlog_table(matrix: List[List[str]], context_text: str) -> int
     # 숫자가 많을수록 표일 가능성 증가
     num_count = sum(1 for row in matrix for cell in row if parse_money_like(cell) is not None)
     score += min(num_count, 30)
+    # 재무상태표/손익계산서 같은 무관 표는 강하게 감점
+    if any(k in text for k in ["유동자산", "비유동자산", "자산총계", "부채총계", "자본총계", "자본금", "손익계산서", "재무상태표"]):
+        score -= 200
+
+    # 실제 수주 관련 헤더가 없으면 후보에서 밀어냄
+    if not any(k in text for k in ["수주잔고", "수주상황", "기말수주잔고", "당기말수주잔", "계약잔액", "미이행수행의무", "잔여계약"]):
+        score -= 100
+
     # 너무 작은 표는 감점
     if len(matrix) < 2:
         score -= 50
@@ -1709,113 +1788,194 @@ def fetch_naver_discussion(stock_code: str, corp_name: str, max_items: int = 20)
     return posts
 
 
+def parse_dcinside_date(date_text: str) -> Optional[str]:
+    """
+    디시 목록 날짜 텍스트를 YYYY-MM-DD로 보수적으로 변환.
+    예: 20:55 -> 오늘, 05.14 -> 올해, 26.05.14 -> 2026-05-14
+    """
+    s = str(date_text or "").strip()
+    today = dt.date.today()
+
+    try:
+        if re.fullmatch(r"\d{1,2}:\d{2}", s):
+            return today.isoformat()
+        if re.fullmatch(r"\d{2}\.\d{2}", s):
+            m, d = map(int, s.split("."))
+            candidate = dt.date(today.year, m, d)
+            # 12월 글을 다음해 1월에 볼 때 보정
+            if candidate > today + dt.timedelta(days=7):
+                candidate = dt.date(today.year - 1, m, d)
+            return candidate.isoformat()
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", s):
+            yy, m, d = map(int, s.split("."))
+            return dt.date(2000 + yy, m, d).isoformat()
+        if re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", s):
+            y, m, d = map(int, s.split("."))
+            return dt.date(y, m, d).isoformat()
+    except Exception:
+        return None
+
+    return None
+
+
 def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items: int = 30) -> List[Dict[str, Any]]:
     """
-    디시인사이드 검색 전용 수집.
-    100% 보장은 불가능하지만, 여러 URL 패턴/파서를 순차 시도해 성공률을 높인다.
+    디시인사이드 '주식 갤러리(id=neostock)' 전용 30일치 수집.
+    기존 디시 통합검색보다 안정적으로, 주식갤러리 목록을 직접 페이지 순회한다.
     """
-    queries = []
-    for q in [corp_name, stock_code, f"{corp_name} 주식", f"{corp_name} 실적"]:
-        if q and q not in queries:
-            queries.append(q)
+    lookback_days = 30
+    cutoff = dt.date.today() - dt.timedelta(days=lookback_days)
 
     headers = {
         **HEADERS,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Referer": "https://www.dcinside.com/",
+        "Referer": "https://gall.dcinside.com/board/lists/?id=neostock",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
+    # 종목명/코드/일부 공백 제거형 키워드로 제목 필터
+    keywords = [corp_name]
+    if stock_code:
+        keywords.append(stock_code)
+    if corp_name:
+        keywords.append(corp_name.replace(" ", ""))
+    keywords = [k for i, k in enumerate(keywords) if k and k not in keywords[:i]]
+
     posts = []
     seen = set()
+    stop_due_to_old = False
 
-    def add_post(title, href, source_url):
-        title = strip_html_tags(title).strip()
-        href = str(href or "").strip()
-        if not title:
-            return
-        # 종목명 또는 종목코드가 제목/URL 주변에 있으면 우선 채택.
-        # 너무 엄격하면 누락되므로 corp_name 없는 결과도 일부 허용하되 검색 URL 기반으로만 수집.
-        if corp_name not in title and stock_code and stock_code not in title:
-            # 주식/실적/수주 같은 맥락어가 있으면 허용
-            if not any(k in title for k in ["주식", "실적", "수주", "급등", "하락", "상승", "고점", "저점", "매수", "매도"]):
-                return
-        if href.startswith("//"):
-            href = "https:" + href
-        elif href.startswith("/"):
-            href = "https://gall.dcinside.com" + href
-        if not href:
-            href = source_url
-        key = href + "|" + title
-        if key in seen:
-            return
-        seen.add(key)
-        posts.append({
-            "source": "dcinside",
-            "date": None,
-            "title": title[:160],
-            "url": href,
-            "sentiment": sentiment_from_text(title),
-            "keywords": extract_reaction_keywords(title)
-        })
+    def accept_title(title: str) -> bool:
+        title_norm = str(title or "").replace(" ", "")
+        for k in keywords:
+            if k and k.replace(" ", "") in title_norm:
+                return True
+        return False
 
-    for q in queries:
-        encoded = requests.utils.quote(q)
-        urls = [
-            f"https://search.dcinside.com/post/q/{encoded}/sort/latest",
-            f"https://search.dcinside.com/combine/q/{encoded}",
-            f"https://search.dcinside.com/post/p/1/q/{encoded}/sort/latest",
+    # 주식갤러리 최신글은 회전이 빨라 넉넉히 80페이지까지 시도하되, 30일 이전 날짜가 나오면 중단
+    for page in range(1, 81):
+        if stop_due_to_old or len(posts) >= max_items:
+            break
+
+        url = f"https://gall.dcinside.com/board/lists/?id=neostock&page={page}"
+        try:
+            html = requests.get(url, headers=headers, timeout=12).text
+            soup = BeautifulSoup(html, "html.parser")
+
+            rows = soup.select("tr.ub-content")
+            if not rows:
+                # 구조 변경 fallback
+                rows = soup.select("tbody tr")
+
+            page_had_old = False
+
+            for tr in rows:
+                # 공지/광고 제외
+                row_text = tr.get_text(" ", strip=True)
+                if "공지" in row_text[:10] or "AD" in row_text[:10] or "설문" in row_text[:10]:
+                    continue
+
+                a = tr.select_one("td.gall_tit a") or tr.select_one("a")
+                if not a:
+                    continue
+
+                title = a.get_text(" ", strip=True)
+                if not title or not accept_title(title):
+                    continue
+
+                date_cell = tr.select_one("td.gall_date")
+                date_raw = date_cell.get_text(" ", strip=True) if date_cell else ""
+                ymd = parse_dcinside_date(date_raw)
+
+                if ymd:
+                    try:
+                        d = dt.date.fromisoformat(ymd)
+                        if d < cutoff:
+                            page_had_old = True
+                            continue
+                    except Exception:
+                        pass
+
+                href = a.get("href") or ""
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = "https://gall.dcinside.com" + href
+
+                key = href or title
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                posts.append({
+                    "source": "dcinside_neostock",
+                    "gallery": "주식 갤러리",
+                    "gallery_id": "neostock",
+                    "date": ymd or date_raw,
+                    "title": title[:160],
+                    "url": href,
+                    "sentiment": sentiment_from_text(title),
+                    "keywords": extract_reaction_keywords(title)
+                })
+
+                if len(posts) >= max_items:
+                    break
+
+            # 오래된 날짜가 나왔고, 페이지가 어느 정도 진행됐다면 중단
+            if page_had_old and page >= 3:
+                stop_due_to_old = True
+
+        except Exception:
+            continue
+
+    # 주식갤러리 직접 순회 실패 시, 기존 통합검색 URL을 보조로 1회 시도
+    if not posts:
+        q = requests.utils.quote(corp_name)
+        fallback_urls = [
+            f"https://search.dcinside.com/post/q/{q}/sort/latest",
+            f"https://search.dcinside.com/combine/q/{q}",
         ]
-
-        for url in urls:
-            if len(posts) >= max_items:
-                break
+        for url in fallback_urls:
             try:
                 html = requests.get(url, headers=headers, timeout=12).text
                 soup = BeautifulSoup(html, "html.parser")
-
-                # 1) 검색결과 리스트에서 제목 링크 추출
-                selectors = [
-                    "a.tit_txt",
-                    "a.sch_result_title",
-                    ".sch_result_list a",
-                    ".result_list a",
-                    "li a",
-                    "a"
-                ]
-                for sel in selectors:
-                    for a in soup.select(sel):
-                        if len(posts) >= max_items:
-                            break
-                        title = a.get_text(" ", strip=True)
-                        href = a.get("href") or ""
-                        if not title or len(title) < 2:
-                            continue
-                        if "dcinside" not in href and not href.startswith("/"):
-                            continue
-                        add_post(title, href, url)
-                    if posts:
+                for a in soup.select("a"):
+                    title = a.get_text(" ", strip=True)
+                    href = a.get("href") or ""
+                    if not title or not accept_title(title):
+                        continue
+                    if "dcinside" not in href and not href.startswith("/"):
+                        continue
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    elif href.startswith("/"):
+                        href = "https://gall.dcinside.com" + href
+                    key = href or title
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    posts.append({
+                        "source": "dcinside_search_fallback",
+                        "gallery": "디시 검색",
+                        "gallery_id": None,
+                        "date": None,
+                        "title": title[:160],
+                        "url": href,
+                        "sentiment": sentiment_from_text(title),
+                        "keywords": extract_reaction_keywords(title)
+                    })
+                    if len(posts) >= max_items:
                         break
-
-                # 2) 정규식 fallback
-                if not posts:
-                    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.I | re.S):
-                        href = m.group(1)
-                        raw_title = re.sub(r"<[^>]+>", " ", m.group(2))
-                        title = re.sub(r"\s+", " ", raw_title).strip()
-                        if "dcinside" in href or href.startswith("/"):
-                            add_post(title, href, url)
-                            if len(posts) >= max_items:
-                                break
             except Exception:
                 continue
+            if posts:
+                break
 
     return posts[:max_items]
 
 def build_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
     """
-    커뮤니티는 디시인사이드만 사용.
-    네이버 종목토론실은 사용하지 않는다.
+    커뮤니티는 디시인사이드 주식 갤러리(id=neostock) 30일치 목록 순회 결과만 사용.
     """
     posts = fetch_dcinside_search_posts(corp_name, stock_code, max_items=30)
 
@@ -1842,17 +2002,19 @@ def build_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
             summary_parts.append("긍정·부정 언급이 혼재")
         summary = "; ".join(summary_parts)
         status = "ok"
-        note = "디시인사이드 검색 결과 기준"
+        note = "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 기준"
     else:
-        summary = "디시인사이드 자동 수집 결과 없음"
+        summary = "디시인사이드 주식 갤러리 최근 30일 자동 수집 결과 없음"
         status = "확인 불가"
-        note = "디시인사이드 검색 페이지 차단, 구조 변경, 결과 없음 중 하나일 수 있음"
+        note = "주식갤러리 30일 목록에서 종목명/종목코드가 포함된 제목을 찾지 못했거나 페이지 구조/접속 차단 가능성"
 
     return {
         "status": status,
         "as_of": dt.date.today().isoformat(),
-        "lookback_days": 14,
-        "sources": ["dcinside"],
+        "lookback_days": 30,
+        "sources": ["dcinside_neostock"],
+        "gallery": "주식 갤러리",
+        "gallery_id": "neostock",
         "mention_count": len(posts),
         "top_keywords": top_keywords,
         "sentiment": sentiment,
@@ -1899,13 +2061,13 @@ def stock_report(name: str = Query(..., description="종목명 예: 삼천당제
             "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
             "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
             "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
-            "community": "디시인사이드 검색 참고. 네이버 종목토론실은 사용하지 않음"
+            "community": "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
         },
         "price": fetch_naver_price(stock_code),
         "weekly_price_summary": weekly_summary(stock_code),
         "historical_financials": historical_financials(corp_code),
-        "latest_regular_report": latest_regular_report(corp_code),
-        "order_backlog": fetch_order_backlog(corp_code),
+        "latest_regular_report": sanitize_latest_regular_report(latest_regular_report(corp_code)),
+        "order_backlog": sanitize_order_backlog_result(fetch_order_backlog(corp_code)),
         "sales_breakdown": fetch_sales_breakdown(corp_code),
         "consensus": fetch_fnguide_consensus(stock_code),
         "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
