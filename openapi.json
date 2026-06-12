@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Korean Stock Quick Study API",
-    "description": "한국 주식 종목 데이터를 반환합니다. GET /stock-report, GET/POST /getStockReport 모두 지원합니다.",
-    "version": "3.1.0"
+    "description": "한국 주식 종목 데이터를 반환합니다. 디시인사이드 주식갤러리 반응은 최근 7일, 최대 60페이지 경량 수집 기준입니다.",
+    "version": "3.3.0"
   },
   "servers": [
     {

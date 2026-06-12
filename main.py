@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import io
 import datetime as dt
 import xml.etree.ElementTree as ET
@@ -16,7 +17,7 @@ DART_API_KEY = os.getenv("DART_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="3.1.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="3.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,7 +49,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v3.1-action-compat"
+        "version": "v3.3-dcinside-neostock-7d-60p"
     }
 
 
@@ -211,7 +212,7 @@ def dart_single_account_all(corp_code: str, year: int, report_code: str, fs_div:
     try:
         url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
         params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code, "bsns_year": str(year), "reprt_code": report_code, "fs_div": fs_div}
-        js = requests.get(url, params=params, timeout=12).json()
+        js = requests.get(url, params=params, timeout=5).json()
         if js.get("status") != "000":
             return []
         return js.get("list", [])
@@ -1736,7 +1737,7 @@ def build_recent_news(corp_name: str, stock_code: str, aliases: Optional[List[st
     return {
         "status": "ok" if unique else "확인 불가",
         "as_of": dt.date.today().isoformat(),
-        "lookback_days": 30,
+        "lookback_days": 7,
         "items": unique[:10],
         "source_status": {
             "naver_openapi": api_news.get("status"),
@@ -1821,10 +1822,10 @@ def parse_dcinside_date(date_text: str) -> Optional[str]:
 
 def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items: int = 30) -> List[Dict[str, Any]]:
     """
-    디시인사이드 '주식 갤러리(id=neostock)' 전용 30일치 수집.
+    디시인사이드 '주식 갤러리(id=neostock)' 전용 7일치 경량 수집.
     기존 디시 통합검색보다 안정적으로, 주식갤러리 목록을 직접 페이지 순회한다.
     """
-    lookback_days = 30
+    lookback_days = 7
     cutoff = dt.date.today() - dt.timedelta(days=lookback_days)
 
     headers = {
@@ -1845,6 +1846,8 @@ def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items:
     posts = []
     seen = set()
     stop_due_to_old = False
+    started_at = time.time()
+    max_seconds = 18
 
     def accept_title(title: str) -> bool:
         title_norm = str(title or "").replace(" ", "")
@@ -1853,14 +1856,16 @@ def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items:
                 return True
         return False
 
-    # 주식갤러리 최신글은 회전이 빨라 넉넉히 80페이지까지 시도하되, 30일 이전 날짜가 나오면 중단
-    for page in range(1, 81):
+    # 주식갤러리 최신글은 7일치만 가볍게 확인. Render timeout 방지를 위해 최대 60페이지까지 순회
+    for page in range(1, 61):
         if stop_due_to_old or len(posts) >= max_items:
+            break
+        if time.time() - started_at > max_seconds:
             break
 
         url = f"https://gall.dcinside.com/board/lists/?id=neostock&page={page}"
         try:
-            html = requests.get(url, headers=headers, timeout=12).text
+            html = requests.get(url, headers=headers, timeout=5).text
             soup = BeautifulSoup(html, "html.parser")
 
             rows = soup.select("tr.ub-content")
@@ -1923,7 +1928,7 @@ def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items:
                     break
 
             # 오래된 날짜가 나왔고, 페이지가 어느 정도 진행됐다면 중단
-            if page_had_old and page >= 3:
+            if page_had_old and page >= 2:
                 stop_due_to_old = True
 
         except Exception:
@@ -1938,7 +1943,7 @@ def fetch_dcinside_search_posts(corp_name: str, stock_code: str = "", max_items:
         ]
         for url in fallback_urls:
             try:
-                html = requests.get(url, headers=headers, timeout=12).text
+                html = requests.get(url, headers=headers, timeout=5).text
                 soup = BeautifulSoup(html, "html.parser")
                 for a in soup.select("a"):
                     title = a.get_text(" ", strip=True)
@@ -2003,16 +2008,16 @@ def build_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
             summary_parts.append("긍정·부정 언급이 혼재")
         summary = "; ".join(summary_parts)
         status = "ok"
-        note = "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 기준"
+        note = "디시인사이드 주식 갤러리(id=neostock) 최근 7일 목록 순회 기준"
     else:
-        summary = "디시인사이드 주식 갤러리 최근 30일 자동 수집 결과 없음"
+        summary = "디시인사이드 주식 갤러리 최근 7일 자동 수집 결과 없음"
         status = "확인 불가"
-        note = "주식갤러리 30일 목록에서 종목명/종목코드가 포함된 제목을 찾지 못했거나 페이지 구조/접속 차단 가능성"
+        note = "주식갤러리 7일 목록에서 종목명/종목코드가 포함된 제목을 찾지 못했거나 페이지 구조/접속 차단 가능성"
 
     return {
         "status": status,
         "as_of": dt.date.today().isoformat(),
-        "lookback_days": 30,
+        "lookback_days": 7,
         "sources": ["dcinside_neostock"],
         "gallery": "주식 갤러리",
         "gallery_id": "neostock",
@@ -2050,6 +2055,27 @@ class StockRequest(BaseModel):
     name: str
 
 
+def safe_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
+    try:
+        return build_community_reaction(corp_name, stock_code)
+    except Exception as e:
+        return {
+            "status": "확인 불가",
+            "as_of": dt.date.today().isoformat(),
+            "lookback_days": 7,
+            "sources": ["dcinside_neostock"],
+            "gallery": "주식 갤러리",
+            "gallery_id": "neostock",
+            "mention_count": 0,
+            "top_keywords": [],
+            "sentiment": {"positive": 0, "negative": 0, "neutral": 0},
+            "summary": "디시인사이드 주식 갤러리 자동 수집 실패",
+            "sample_posts": [],
+            "warning": "디시인사이드 글은 사실 검증되지 않은 투자자 의견",
+            "note": f"디시 수집 중 오류: {str(e)[:120]}"
+        }
+
+
 def build_stock_report(name: str) -> Dict[str, Any]:
     try:
         resolved = resolve_stock(name)
@@ -2067,7 +2093,7 @@ def build_stock_report(name: str) -> Dict[str, Any]:
                 "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
                 "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
                 "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
-                "community": "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
+                "community": "디시인사이드 주식 갤러리(id=neostock) 최근 7일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
             },
             "price": fetch_naver_price(stock_code),
             "weekly_price_summary": weekly_summary(stock_code),
@@ -2077,7 +2103,7 @@ def build_stock_report(name: str) -> Dict[str, Any]:
             "sales_breakdown": fetch_sales_breakdown(corp_code),
             "consensus": fetch_fnguide_consensus(stock_code),
             "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
-            "community_reaction": build_community_reaction(resolved["name"], stock_code),
+            "community_reaction": safe_community_reaction(resolved["name"], stock_code),
             "dcinside_community": dcinside_links(resolved["name"]),
             "report_prompt_for_gpt": "위 JSON을 바탕으로 1페이지 한국 주식 퀵 스터디 리포트를 작성하세요. 불확실한 항목은 확인 불가로 표시하고, 매수/매도 추천은 하지 마세요."
         }
