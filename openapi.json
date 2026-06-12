@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Korean Stock Quick Study API",
-    "description": "한국 주식 종목 데이터를 반환하며, 커뮤니티 반응은 디시인사이드 주식 갤러리 30일 목록을 순회해 수집합니다.",
-    "version": "3.0.0"
+    "description": "한국 주식 종목 데이터를 반환합니다. GET /stock-report, GET/POST /getStockReport 모두 지원합니다.",
+    "version": "3.1.0"
   },
   "servers": [
     {
@@ -15,13 +15,13 @@
       "get": {
         "operationId": "getStockReport",
         "summary": "한국 주식 퀵 스터디 데이터 조회",
-        "description": "종목명을 입력하면 주가, 시가총액, DART 재무, CompanyGuide/FnGuide 컨센서스 데이터를 조회합니다.",
+        "description": "종목명을 입력하면 주가, 시가총액, DART 재무, 컨센서스, 뉴스/커뮤니티 데이터를 조회합니다.",
         "parameters": [
           {
             "name": "name",
             "in": "query",
             "required": true,
-            "description": "한국 주식 종목명. 예: 삼천당제약",
+            "description": "한국 주식 종목명. 예: 두산테스나",
             "schema": {
               "type": "string"
             }
@@ -36,6 +36,9 @@
                   "type": "object",
                   "additionalProperties": true,
                   "properties": {
+                    "status": {
+                      "type": "string"
+                    },
                     "input": {
                       "type": "string"
                     },
@@ -66,16 +69,25 @@
                       "type": "object",
                       "additionalProperties": true
                     },
+                    "order_backlog": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "sales_breakdown": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
                     "consensus": {
                       "type": "object",
                       "additionalProperties": true
                     },
                     "recent_news": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "community_reaction": {
+                      "type": "object",
+                      "additionalProperties": true
                     },
                     "dcinside_community": {
                       "type": "array",
@@ -83,6 +95,75 @@
                         "type": "object",
                         "additionalProperties": true
                       }
+                    },
+                    "report_prompt_for_gpt": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/getStockReport": {
+      "get": {
+        "operationId": "getStockReportGetAlias",
+        "summary": "한국 주식 퀵 스터디 데이터 조회",
+        "description": "종목명을 입력하면 주가, 시가총액, DART 재무, 컨센서스, 뉴스/커뮤니티 데이터를 조회합니다.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "description": "한국 주식 종목명. 예: 두산테스나",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "종목 퀵 스터디 데이터",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "input": {
+                      "type": "string"
+                    },
+                    "resolved": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "data_basis": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "price": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "weekly_price_summary": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "historical_financials": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "latest_regular_report": {
+                      "type": "object",
+                      "additionalProperties": true
                     },
                     "order_backlog": {
                       "type": "object",
@@ -92,9 +173,129 @@
                       "type": "object",
                       "additionalProperties": true
                     },
+                    "consensus": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "recent_news": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
                     "community_reaction": {
                       "type": "object",
                       "additionalProperties": true
+                    },
+                    "dcinside_community": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "report_prompt_for_gpt": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "getStockReportPost",
+        "summary": "한국 주식 퀵 스터디 데이터 조회 POST 호환",
+        "description": "기존 GPT Action 호환용 POST 엔드포인트입니다.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "한국 주식 종목명. 예: 두산테스나"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "종목 퀵 스터디 데이터",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "input": {
+                      "type": "string"
+                    },
+                    "resolved": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "data_basis": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "price": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "weekly_price_summary": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "historical_financials": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "latest_regular_report": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "order_backlog": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "sales_breakdown": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "consensus": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "recent_news": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "community_reaction": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "dcinside_community": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "report_prompt_for_gpt": {
+                      "type": "string"
                     }
                   }
                 }

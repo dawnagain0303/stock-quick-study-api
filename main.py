@@ -10,12 +10,13 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="3.0.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,7 +48,7 @@ def health():
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v3.0-dcinside-neostock-30d"
+        "version": "v3.1-action-compat"
     }
 
 
@@ -2045,33 +2046,55 @@ def dcinside_links(name: str) -> List[Dict[str, str]]:
     return [{"note": "디시인사이드 검색은 차단/구조변경 가능성이 있어 GPT가 참고 링크로 확인", "search_url": f"https://search.dcinside.com/post/q/{q}/sort/latest"}]
 
 
+class StockRequest(BaseModel):
+    name: str
+
+
+def build_stock_report(name: str) -> Dict[str, Any]:
+    try:
+        resolved = resolve_stock(name)
+        if not resolved.get("stock_code"):
+            return {"status": "failed", "input": name, "resolved": resolved, "error": resolved.get("error")}
+        stock_code = resolved["stock_code"]
+        corp_code = resolved.get("corp_code")
+        return {
+            "status": "ok",
+            "input": name,
+            "resolved": resolved,
+            "data_basis": {
+                "price_market_cap": "네이버증권 일별시세 최신 종가 기준",
+                "historical_financials": "DART 사업보고서 기준",
+                "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
+                "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
+                "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
+                "community": "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
+            },
+            "price": fetch_naver_price(stock_code),
+            "weekly_price_summary": weekly_summary(stock_code),
+            "historical_financials": historical_financials(corp_code),
+            "latest_regular_report": sanitize_latest_regular_report(latest_regular_report(corp_code)),
+            "order_backlog": sanitize_order_backlog_result(fetch_order_backlog(corp_code)),
+            "sales_breakdown": fetch_sales_breakdown(corp_code),
+            "consensus": fetch_fnguide_consensus(stock_code),
+            "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
+            "community_reaction": build_community_reaction(resolved["name"], stock_code),
+            "dcinside_community": dcinside_links(resolved["name"]),
+            "report_prompt_for_gpt": "위 JSON을 바탕으로 1페이지 한국 주식 퀵 스터디 리포트를 작성하세요. 불확실한 항목은 확인 불가로 표시하고, 매수/매도 추천은 하지 마세요."
+        }
+    except Exception as e:
+        return {"status": "failed", "input": name, "error": str(e), "partial": {}}
+
+
 @app.get("/stock-report")
 def stock_report(name: str = Query(..., description="종목명 예: 삼천당제약")):
-    resolved = resolve_stock(name)
-    if not resolved.get("stock_code"):
-        return {"input": name, "resolved": resolved, "error": resolved.get("error")}
-    stock_code = resolved["stock_code"]
-    corp_code = resolved.get("corp_code")
-    return {
-        "input": name,
-        "resolved": resolved,
-        "data_basis": {
-            "price_market_cap": "네이버증권 일별시세 최신 종가 기준",
-            "historical_financials": "DART 사업보고서 기준",
-            "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
-            "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
-            "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
-            "community": "디시인사이드 주식 갤러리(id=neostock) 최근 30일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
-        },
-        "price": fetch_naver_price(stock_code),
-        "weekly_price_summary": weekly_summary(stock_code),
-        "historical_financials": historical_financials(corp_code),
-        "latest_regular_report": sanitize_latest_regular_report(latest_regular_report(corp_code)),
-        "order_backlog": sanitize_order_backlog_result(fetch_order_backlog(corp_code)),
-        "sales_breakdown": fetch_sales_breakdown(corp_code),
-        "consensus": fetch_fnguide_consensus(stock_code),
-        "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
-        "community_reaction": build_community_reaction(resolved["name"], stock_code),
-        "dcinside_community": dcinside_links(resolved["name"]),
-        "report_prompt_for_gpt": "위 JSON을 바탕으로 1페이지 한국 주식 퀵 스터디 리포트를 작성하세요. 불확실한 항목은 확인 불가로 표시하고, 매수/매도 추천은 하지 마세요."
-    }
+    return build_stock_report(name)
+
+
+@app.get("/getStockReport")
+def get_stock_report_get(name: str = Query(..., description="종목명 예: 삼천당제약")):
+    return build_stock_report(name)
+
+
+@app.post("/getStockReport")
+def get_stock_report_post(req: StockRequest):
+    return build_stock_report(req.name)

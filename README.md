@@ -1,11 +1,13 @@
-# stock-quick-study-api v3.0 dcinside neostock 30d
+# stock-quick-study-api v3.1 action compat
 
 수정 사항:
-- v2.9 자본총계/수주잔고 검증 유지
-- 디시 커뮤니티 수집 방식을 통합검색에서 주식 갤러리(id=neostock) 30일치 목록 순회 방식으로 변경
-- 종목명/종목코드가 제목에 포함된 글을 sample_posts로 수집
-- 실패 시 디시 통합검색 fallback 1회 시도
-- 네이버 종목토론실은 사용하지 않음
+- v3.0 기능 유지
+- GPT Action 호환성 보강
+- 기존 GET /stock-report?name=종목명 유지
+- 추가 GET /getStockReport?name=종목명 지원
+- 추가 POST /getStockReport {"name":"종목명"} 지원
+- OpenAPI recent_news 스키마를 실제 응답(object)에 맞게 수정
+- 예외 발생 시 status=failed JSON 반환
 
 환경변수:
 - DART_API_KEY
