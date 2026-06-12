@@ -1,19 +1,18 @@
-# stock-quick-study-api v3.3 dcinside neostock 7d 60p
+# stock-quick-study-api v3.5 naver news blog
 
 수정 사항:
-- v3.2 기능 유지
-- 디시인사이드 주식 갤러리(id=neostock) 수집 기간은 최근 7일 유지
-- 페이지 순회 범위를 15페이지 -> 60페이지로 확대
-- max_items 15개 -> 30개로 확대
-- 오래된 날짜가 나오면 조기 중단
-- 전체 디시 수집 시간 예산 18초 추가
-- 디시 수집 실패/시간초과 시 전체 API가 죽지 않고 community_reaction만 확인 불가 처리
+- 디시인사이드 수집 제거
+- 메인 /stock-report 안정성 우선
+- 네이버 뉴스 30일 recent_news 유지
+- 네이버 블로그 30일 blog_reaction 추가
+- /blog-reaction?name=종목명 별도 조회 지원
+- GET/POST /getStockReport 호환 유지
+- 큰 raw/debug 필드 제거 유지
 
-주의:
-- 주식갤러리 글 회전이 매우 빠르면 60페이지도 7일 전체를 보장하지는 않음
-- 디시 공식 API가 아니므로 차단/구조변경 가능성 있음
-
-환경변수:
+필요 환경변수:
 - DART_API_KEY
-- NAVER_CLIENT_ID (선택)
-- NAVER_CLIENT_SECRET (선택)
+- NAVER_CLIENT_ID
+- NAVER_CLIENT_SECRET
+
+참고:
+- NAVER_CLIENT_ID / NAVER_CLIENT_SECRET이 없으면 blog_reaction은 확인 불가 또는 빈 결과로 표시됩니다.

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Korean Stock Quick Study API",
-    "description": "한국 주식 종목 데이터를 반환합니다. 디시인사이드 주식갤러리 반응은 최근 7일, 최대 60페이지 경량 수집 기준입니다.",
-    "version": "3.3.0"
+    "version": "3.5.0",
+    "description": "한국 주식 종목 데이터를 반환합니다. 디시를 제외하고 네이버 뉴스 30일 및 네이버 블로그 30일 검색 결과를 제공합니다."
   },
   "servers": [
     {
@@ -11,95 +11,48 @@
     }
   ],
   "paths": {
+    "/health": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/stock-report": {
       "get": {
         "operationId": "getStockReport",
         "summary": "한국 주식 퀵 스터디 데이터 조회",
-        "description": "종목명을 입력하면 주가, 시가총액, DART 재무, 컨센서스, 뉴스/커뮤니티 데이터를 조회합니다.",
         "parameters": [
           {
             "name": "name",
             "in": "query",
             "required": true,
-            "description": "한국 주식 종목명. 예: 두산테스나",
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "종목명 예: 삼성전자"
           }
         ],
         "responses": {
           "200": {
-            "description": "종목 퀵 스터디 데이터",
+            "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "additionalProperties": true,
-                  "properties": {
-                    "status": {
-                      "type": "string"
-                    },
-                    "input": {
-                      "type": "string"
-                    },
-                    "resolved": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "data_basis": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "price": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "weekly_price_summary": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "historical_financials": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "latest_regular_report": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "order_backlog": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "sales_breakdown": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "consensus": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "recent_news": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "community_reaction": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "dcinside_community": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "report_prompt_for_gpt": {
-                      "type": "string"
-                    }
-                  }
+                  "additionalProperties": true
                 }
               }
             }
@@ -109,15 +62,13 @@
     },
     "/getStockReport": {
       "get": {
-        "operationId": "getStockReportGetAlias",
-        "summary": "한국 주식 퀵 스터디 데이터 조회",
-        "description": "종목명을 입력하면 주가, 시가총액, DART 재무, 컨센서스, 뉴스/커뮤니티 데이터를 조회합니다.",
+        "operationId": "getStockReportAlias",
+        "summary": "한국 주식 퀵 스터디 데이터 조회 GET 호환",
         "parameters": [
           {
             "name": "name",
             "in": "query",
             "required": true,
-            "description": "한국 주식 종목명. 예: 두산테스나",
             "schema": {
               "type": "string"
             }
@@ -125,77 +76,12 @@
         ],
         "responses": {
           "200": {
-            "description": "종목 퀵 스터디 데이터",
+            "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "additionalProperties": true,
-                  "properties": {
-                    "status": {
-                      "type": "string"
-                    },
-                    "input": {
-                      "type": "string"
-                    },
-                    "resolved": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "data_basis": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "price": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "weekly_price_summary": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "historical_financials": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "latest_regular_report": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "order_backlog": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "sales_breakdown": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "consensus": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "recent_news": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "community_reaction": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "dcinside_community": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "report_prompt_for_gpt": {
-                      "type": "string"
-                    }
-                  }
+                  "additionalProperties": true
                 }
               }
             }
@@ -205,7 +91,6 @@
       "post": {
         "operationId": "getStockReportPost",
         "summary": "한국 주식 퀵 스터디 데이터 조회 POST 호환",
-        "description": "기존 GPT Action 호환용 POST 엔드포인트입니다.",
         "requestBody": {
           "required": true,
           "content": {
@@ -217,8 +102,7 @@
                 ],
                 "properties": {
                   "name": {
-                    "type": "string",
-                    "description": "한국 주식 종목명. 예: 두산테스나"
+                    "type": "string"
                   }
                 }
               }
@@ -227,77 +111,42 @@
         },
         "responses": {
           "200": {
-            "description": "종목 퀵 스터디 데이터",
+            "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "additionalProperties": true,
-                  "properties": {
-                    "status": {
-                      "type": "string"
-                    },
-                    "input": {
-                      "type": "string"
-                    },
-                    "resolved": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "data_basis": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "price": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "weekly_price_summary": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "historical_financials": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "latest_regular_report": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "order_backlog": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "sales_breakdown": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "consensus": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "recent_news": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "community_reaction": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "dcinside_community": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": true
-                      }
-                    },
-                    "report_prompt_for_gpt": {
-                      "type": "string"
-                    }
-                  }
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/blog-reaction": {
+      "get": {
+        "operationId": "getBlogReaction",
+        "summary": "네이버 블로그 30일 반응 조회",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "종목명 예: 삼성전자"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

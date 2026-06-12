@@ -17,7 +17,7 @@ DART_API_KEY = os.getenv("DART_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-app = FastAPI(title="Korean Stock Quick Study API", version="3.3.0")
+app = FastAPI(title="Korean Stock Quick Study API", version="3.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,13 +43,23 @@ FALLBACK_STOCKS = {
 }
 
 
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "stock-quick-study-api",
+        "version": "v3.5-naver-news-blog",
+        "endpoints": ["/health", "/stock-report?name=삼성전자", "/getStockReport?name=삼성전자", "/blog-reaction?name=삼성전자"]
+    }
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "message": "stock-quick-study-api is running",
         "dart_key_loaded": bool(DART_API_KEY),
-        "version": "v3.3-dcinside-neostock-7d-60p"
+        "version": "v3.5-naver-news-blog"
     }
 
 
@@ -2031,6 +2041,150 @@ def build_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
     }
 
 
+def naver_blog_search(query: str, display: int = 50) -> List[Dict[str, Any]]:
+    """
+    네이버 블로그 검색 OpenAPI.
+    NAVER_CLIENT_ID / NAVER_CLIENT_SECRET가 없으면 빈 리스트.
+    """
+    cid = os.getenv("NAVER_CLIENT_ID")
+    csec = os.getenv("NAVER_CLIENT_SECRET")
+    if not cid or not csec:
+        return []
+
+    url = "https://openapi.naver.com/v1/search/blog.json"
+    headers = {
+        "X-Naver-Client-Id": cid,
+        "X-Naver-Client-Secret": csec,
+    }
+    params = {
+        "query": query,
+        "display": min(max(display, 10), 100),
+        "start": 1,
+        "sort": "date",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        items = []
+        for it in data.get("items", []):
+            title = clean_html(it.get("title", ""))
+            desc = clean_html(it.get("description", ""))
+            postdate = it.get("postdate")
+            date_iso = None
+            if postdate and re.fullmatch(r"\d{8}", postdate):
+                date_iso = f"{postdate[:4]}-{postdate[4:6]}-{postdate[6:8]}"
+            items.append({
+                "date": date_iso,
+                "source": "Naver Blog API",
+                "title": title,
+                "url": it.get("link"),
+                "blogger": clean_html(it.get("bloggername", "")),
+                "summary": desc,
+                "query": query,
+                "topic": classify_news_topic(title + " " + desc),
+                "tone": classify_tone(title + " " + desc),
+                "keywords": extract_reaction_keywords(title + " " + desc),
+            })
+        return items
+    except Exception:
+        return []
+
+
+def build_blog_reaction(corp_name: str, stock_code: str, lookback_days: int = 30) -> Dict[str, Any]:
+    """
+    네이버 블로그 최근 30일 검색 결과 요약.
+    """
+    as_of = dt.date.today()
+    cutoff = as_of - dt.timedelta(days=lookback_days)
+
+    queries = [corp_name]
+    if stock_code:
+        queries.append(f"{corp_name} {stock_code}")
+
+    raw_items = []
+    seen = set()
+    for q in queries:
+        for item in naver_blog_search(q, display=50):
+            key = item.get("url") or item.get("title")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            d = item.get("date")
+            if d:
+                try:
+                    if dt.date.fromisoformat(d) < cutoff:
+                        continue
+                except Exception:
+                    pass
+
+            # 종목명 또는 종목코드가 제목/요약에 들어간 것 중심
+            hay = f"{item.get('title','')} {item.get('summary','')}"
+            if corp_name not in hay and (not stock_code or stock_code not in hay):
+                continue
+
+            score = 0
+            if corp_name in item.get("title", ""):
+                score += 30
+            if stock_code and stock_code in hay:
+                score += 20
+            if item.get("date"):
+                score += 10
+            if item.get("keywords"):
+                score += len(item.get("keywords")) * 2
+
+            item["relevance_score"] = score
+            raw_items.append(item)
+
+    raw_items.sort(key=lambda x: (x.get("date") or "", x.get("relevance_score") or 0), reverse=True)
+
+    keyword_counts = {}
+    tone_counts = {"positive_candidate": 0, "negative_candidate": 0, "neutral": 0, "unclear": 0}
+    topic_counts = {}
+    for it in raw_items:
+        tone = it.get("tone") or "unclear"
+        tone_counts[tone] = tone_counts.get(tone, 0) + 1
+        topic = it.get("topic") or "기타"
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        for k in it.get("keywords") or []:
+            keyword_counts[k] = keyword_counts.get(k, 0) + 1
+
+    top_keywords = [{"keyword": k, "count": v} for k, v in sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)[:10]]
+    top_topics = [{"topic": k, "count": v} for k, v in sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:8]]
+
+    if raw_items:
+        summary_parts = []
+        if top_topics:
+            summary_parts.append("주요 주제: " + ", ".join([x["topic"] for x in top_topics[:3]]))
+        if top_keywords:
+            summary_parts.append("반복 키워드: " + ", ".join([x["keyword"] for x in top_keywords[:5]]))
+        summary = "; ".join(summary_parts) if summary_parts else "최근 블로그 언급 확인"
+        status = "ok"
+    else:
+        summary = "최근 30일 네이버 블로그 검색 결과 없음 또는 NAVER API 키 미설정"
+        status = "확인 불가"
+
+    return {
+        "status": status,
+        "as_of": as_of.isoformat(),
+        "lookback_days": lookback_days,
+        "source": "Naver Blog API",
+        "mention_count": len(raw_items),
+        "top_keywords": top_keywords,
+        "top_topics": top_topics,
+        "tone_counts": tone_counts,
+        "summary": summary,
+        "items": raw_items[:12],
+        "source_status": {
+            "naver_blog_openapi": "ok" if os.getenv("NAVER_CLIENT_ID") and os.getenv("NAVER_CLIENT_SECRET") else "NAVER API 키 미설정"
+        },
+        "note": "네이버 블로그 검색 API 최신순 결과에서 최근 30일 postdate 기준 필터"
+    }
+
+
 def naver_news(name: str, max_items: int = 5) -> List[Dict[str, str]]:
     # 호환성 유지용. stock_report에서는 build_recent_news를 사용.
     try:
@@ -2055,6 +2209,18 @@ class StockRequest(BaseModel):
     name: str
 
 
+def prune_heavy_fields(obj: Any) -> Any:
+    """
+    브라우저/GPT Action 응답 안정성을 위해 큰 디버그 필드는 제거.
+    """
+    heavy_keys = {"raw_table_preview", "debug_rows_sample", "debug_summary", "selected_preview", "history"}
+    if isinstance(obj, dict):
+        return {k: prune_heavy_fields(v) for k, v in obj.items() if k not in heavy_keys}
+    if isinstance(obj, list):
+        return [prune_heavy_fields(x) for x in obj]
+    return obj
+
+
 def safe_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
     try:
         return build_community_reaction(corp_name, stock_code)
@@ -2075,8 +2241,36 @@ def safe_community_reaction(corp_name: str, stock_code: str) -> Dict[str, Any]:
             "note": f"디시 수집 중 오류: {str(e)[:120]}"
         }
 
+@app.get("/blog-reaction")
+def blog_reaction(name: str = Query(..., description="종목명 예: 삼천당제약")):
+    try:
+        resolved = resolve_stock(name)
+        stock_code = resolved.get("stock_code") or ""
+        corp_name = resolved.get("name") or name
+        return {
+            "status": "ok",
+            "input": name,
+            "resolved": resolved,
+            "blog_reaction": build_blog_reaction(corp_name, stock_code, lookback_days=30)
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "input": name,
+            "error": str(e),
+            "blog_reaction": {
+                "status": "확인 불가",
+                "as_of": dt.date.today().isoformat(),
+                "lookback_days": 30,
+                "source": "Naver Blog API",
+                "mention_count": 0,
+                "summary": "네이버 블로그 수집 실패",
+                "items": []
+            }
+        }
 
-def build_stock_report(name: str) -> Dict[str, Any]:
+
+def build_stock_report(name: str, include_community: bool = False) -> Dict[str, Any]:
     try:
         resolved = resolve_stock(name)
         if not resolved.get("stock_code"):
@@ -2093,7 +2287,7 @@ def build_stock_report(name: str) -> Dict[str, Any]:
                 "cash_debt_ratio_order_backlog": "DART 최신 정기보고서 기준. 수주잔고는 DART 정기보고서 원문 표 파싱 기준",
                 "consensus": "CompanyGuide/FnGuide Financial Highlight 표 파싱 기준. 개인 스터디용 참고",
                 "news": "네이버 뉴스 API 및 네이버증권 종목뉴스 기준. NAVER API 키가 없으면 네이버증권 종목뉴스 중심",
-                "community": "디시인사이드 주식 갤러리(id=neostock) 최근 7일 목록 순회 참고. 네이버 종목토론실은 사용하지 않음"
+                "blog": "네이버 블로그 검색 API 기준. 종목명/종목코드 최신순 검색 후 최근 30일 postdate 필터"
             },
             "price": fetch_naver_price(stock_code),
             "weekly_price_summary": weekly_summary(stock_code),
@@ -2102,9 +2296,7 @@ def build_stock_report(name: str) -> Dict[str, Any]:
             "order_backlog": sanitize_order_backlog_result(fetch_order_backlog(corp_code)),
             "sales_breakdown": fetch_sales_breakdown(corp_code),
             "consensus": fetch_fnguide_consensus(stock_code),
-            "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),
-            "community_reaction": safe_community_reaction(resolved["name"], stock_code),
-            "dcinside_community": dcinside_links(resolved["name"]),
+            "recent_news": build_recent_news(resolved["name"], stock_code, aliases=[]),            "blog_reaction": build_blog_reaction(resolved["name"], stock_code, lookback_days=30),
             "report_prompt_for_gpt": "위 JSON을 바탕으로 1페이지 한국 주식 퀵 스터디 리포트를 작성하세요. 불확실한 항목은 확인 불가로 표시하고, 매수/매도 추천은 하지 마세요."
         }
     except Exception as e:
@@ -2112,15 +2304,15 @@ def build_stock_report(name: str) -> Dict[str, Any]:
 
 
 @app.get("/stock-report")
-def stock_report(name: str = Query(..., description="종목명 예: 삼천당제약")):
-    return build_stock_report(name)
+def stock_report(name: str = Query(..., description="종목명 예: 삼천당제약"), include_community: bool = Query(False, description="사용하지 않음. 호환성 유지용")):
+    return prune_heavy_fields(build_stock_report(name, include_community=include_community))
 
 
 @app.get("/getStockReport")
-def get_stock_report_get(name: str = Query(..., description="종목명 예: 삼천당제약")):
-    return build_stock_report(name)
+def get_stock_report_get(name: str = Query(..., description="종목명 예: 삼천당제약"), include_community: bool = Query(False, description="사용하지 않음. 호환성 유지용")):
+    return prune_heavy_fields(build_stock_report(name, include_community=include_community))
 
 
 @app.post("/getStockReport")
 def get_stock_report_post(req: StockRequest):
-    return build_stock_report(req.name)
+    return prune_heavy_fields(build_stock_report(req.name, include_community=False))
